@@ -66,6 +66,13 @@ describe('loadConfig', () => {
     expect(problems({ WA_GATEWAY_API_KEY: undefined }).join()).toMatch(/WA_GATEWAY_API_KEY/);
     expect(problems({ WA_WEBHOOK_SECRET: '' }).join()).toMatch(/WA_WEBHOOK_SECRET/);
     expect(problems({ GATEWAY_HOST: '192.168.1.10' }).join()).toMatch(/loopback/);
+    // The .env.example placeholders are long enough but must not be used as real secrets.
+    const placeholders = problems({
+      WA_GATEWAY_API_KEY: 'change-me-to-a-long-random-key',
+      WA_WEBHOOK_SECRET: 'change-me-to-another-long-random-secret',
+    }).join('\n');
+    expect(placeholders).toMatch(/WA_GATEWAY_API_KEY still has the placeholder/);
+    expect(placeholders).toMatch(/WA_WEBHOOK_SECRET still has the placeholder/);
   });
 
   it('test_config_accepts_loopback_hosts_and_the_explicit_override', () => {

@@ -74,6 +74,8 @@ export function loadConfig(env: Env = process.env): GatewayConfig {
       problems.push(`${name} is required.`);
     } else if (value.length < MIN_SECRET_LENGTH) {
       problems.push(`${name} must be at least ${MIN_SECRET_LENGTH} characters long.`);
+    } else if (value.toLowerCase().startsWith('change-me')) {
+      problems.push(`${name} still has the placeholder value from .env.example.`);
     }
     return value;
   };
