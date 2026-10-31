@@ -17,6 +17,7 @@ export class FakeClient implements WaClient {
   sendImpl: ((phone: string, text: string) => Promise<{ id: string }>) | undefined;
   logoutCalls = 0;
   startCalls = 0;
+  stop?: () => Promise<void>;
   private readonly handlers: ((event: GatewayEvent) => void)[] = [];
   private counter = 0;
 

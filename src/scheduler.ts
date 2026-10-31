@@ -6,5 +6,6 @@ export interface Scheduler {
 
 export const realScheduler: Scheduler = {
   now: () => Date.now(),
-  sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms))),
+  // Unref'd: pending waits (retries, receipt holds) never keep a stopping process alive.
+  sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)).unref()),
 };
