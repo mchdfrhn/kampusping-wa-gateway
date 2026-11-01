@@ -5,18 +5,24 @@
  * - Session: `useMultiFileAuthState(authDir)`. Baileys documents this store as a reference
  *   implementation rather than a heavy-production store; for one number and a few hundred
  *   messages a day it is adequate. Keep the folder private (0700) and backed up (README).
- * - Connection: `connection.update` is mapped by `nextSnapshot`; on `close` the socket is
- *   rebuilt with capped exponential backoff, immediately for `restartRequired` (sent right after
- *   pairing), and not at all for `loggedOut` (pair again through POST /logout).
+ * - Connection: `connection.update` is mapped by `nextSnapshot`; on `close`, `planAfterClose`
+ *   decides: `loggedOut`, `connectionReplaced` and `forbidden` are terminal (stay disconnected,
+ *   one warning); `restartRequired` (sent right after pairing) restarts at once, at most
+ *   MAX_CONSECUTIVE_RESTARTS times in a row; anything else reconnects with capped exponential
+ *   backoff that only starts over after a connection stayed open STABLE_CONNECTION_MS.
  * - Receipts: `messages.update` entries for our own messages (`key.fromMe`, `key.id`) are mapped
  *   by `eventFromMessageUpdate` (DELIVERY_ACK -> delivered, READ/PLAYED -> read, ERROR -> failed).
  * - Inbound messages are not handled in this milestone and are never logged.
  *
- * The pure helpers below are unit-tested; the socket wiring needs a real phone (manual smoke test).
+ * The pure helpers and the wiring (through injectable BaileysDeps and a fake socket) are unit-
+ * tested; only 
+ealDeps (the real socket factory) needs a real phone (manual smoke test).
  */
 import { mkdir, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import makeWASocket, {
+  type AuthenticationState,
+  type BaileysEventMap,
   Browsers,
   type ConnectionState,
   DisconnectReason,
@@ -26,7 +32,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   type WAMessageUpdate,
   WAMessageStatus,
-  type WASocket,
+  type WAVersion,
 } from '@whiskeysockets/baileys';
 import type { Logger } from 'pino';
 
@@ -39,7 +45,7 @@ import {
   type WaClient,
 } from './client.js';
 import type { BaileysLogLevel } from './config.js';
-import { createBaileysLogger } from './logging.js';
+import { createBaileysLogger, type LibraryLogger } from './logging.js';
 import { maskPhone, phoneToJid } from './phone.js';
 
 // Re-exported so the mapping tests check against the real enums without importing Baileys.
@@ -72,15 +78,6 @@ export function disconnectCode(error: unknown): number | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const code = (error as { output?: { statusCode?: unknown } }).output?.statusCode;
   return typeof code === 'number' ? code : undefined;
-}
-
-export type CloseDecision = 'logged_out' | 'restart_now' | 'reconnect';
-
-export function closeDecision(error: unknown): CloseDecision {
-  const code = disconnectCode(error);
-  if (code === DisconnectReason.loggedOut) return 'logged_out';
-  if (code === DisconnectReason.restartRequired) return 'restart_now';
-  return 'reconnect';
 }
 
 export function reconnectDelayMs(attempt: number, baseMs: number, capMs: number): number {
@@ -124,6 +121,85 @@ export function eventFromMessageUpdate(update: WAMessageUpdate): GatewayEvent | 
   return state ? { type: 'status', provider_message_id: key.id, state } : null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reconnect policy (pure, unit-tested)
+// ---------------------------------------------------------------------------------------------
+
+/** A connection must stay open this long before the backoff (and the restart cap) start over. */
+export const STABLE_CONNECTION_MS = 60_000;
+/** At most this many immediate `restartRequired` restarts in a row; later ones back off. */
+export const MAX_CONSECUTIVE_RESTARTS = 3;
+
+export interface ReconnectState {
+  /** Backoff exponent for the next ordinary reconnect. */
+  attempt: number;
+  /** Immediate restarts (`restartRequired`) in a row. */
+  restarts: number;
+  /** When the current connection opened (null when it never opened). */
+  openedAt: number | null;
+}
+
+export const INITIAL_RECONNECT_STATE: ReconnectState = { attempt: 0, restarts: 0, openedAt: null };
+
+export type TerminalReason = 'logged_out' | 'replaced' | 'forbidden';
+
+export type CloseAction =
+  | { kind: 'terminal'; reason: TerminalReason }
+  | { kind: 'restart_now' }
+  | { kind: 'reconnect'; delayMs: number };
+
+export interface ReconnectPolicy {
+  baseMs: number;
+  capMs: number;
+}
+
+const TERMINAL_CODES = new Map<number, TerminalReason>([
+  [DisconnectReason.loggedOut, 'logged_out'],
+  // Another process or device holds the same session (e.g. a restored backup on another host):
+  // reconnecting would kick it, it would kick us back, forever.
+  [DisconnectReason.connectionReplaced, 'replaced'],
+  // WhatsApp refused the session (restricted or banned number): retrying makes it worse.
+  [DisconnectReason.forbidden, 'forbidden'],
+]);
+
+/**
+ * What to do after the socket closed with `code`. Repeated logins are what gets a number banned,
+ * so the backoff only starts over after a connection stayed open for STABLE_CONNECTION_MS, and
+ * immediate restarts are capped.
+ */
+export function planAfterClose(
+  code: number | undefined,
+  state: ReconnectState,
+  now: number,
+  policy: ReconnectPolicy,
+): { action: CloseAction; next: ReconnectState } {
+  const stable = state.openedAt !== null && now - state.openedAt >= STABLE_CONNECTION_MS;
+  const attempt = stable ? 0 : state.attempt;
+  const restarts = stable ? 0 : state.restarts;
+
+  const terminal = code === undefined ? undefined : TERMINAL_CODES.get(code);
+  if (terminal) {
+    return {
+      action: { kind: 'terminal', reason: terminal },
+      next: { attempt, restarts, openedAt: null },
+    };
+  }
+  if (code === DisconnectReason.restartRequired && restarts < MAX_CONSECUTIVE_RESTARTS) {
+    return {
+      action: { kind: 'restart_now' },
+      next: { attempt, restarts: restarts + 1, openedAt: null },
+    };
+  }
+  return {
+    action: { kind: 'reconnect', delayMs: reconnectDelayMs(attempt, policy.baseMs, policy.capMs) },
+    // A different close reason ends a run of restarts; a capped 515 keeps counting.
+    next: {
+      attempt: attempt + 1,
+      restarts: code === DisconnectReason.restartRequired ? restarts : 0,
+      openedAt: null,
+    },
+  };
+}
 class BoundedMap<K, V> {
   private readonly map = new Map<K, V>();
   constructor(private readonly max: number) {}
@@ -144,8 +220,69 @@ class BoundedMap<K, V> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Socket wiring (manual smoke test)
+// Socket wiring (tested with a fake socket; only `realDeps` needs the manual smoke test)
 // ---------------------------------------------------------------------------------------------
+
+export type { BaileysEventMap };
+export type SocketEventName = 'creds.update' | 'connection.update' | 'messages.update';
+
+/** The part of a Baileys socket the client uses (a real `WASocket` satisfies it). */
+export interface SocketLike {
+  ev: {
+    on<K extends SocketEventName>(event: K, listener: (arg: BaileysEventMap[K]) => void): void;
+  };
+  onWhatsApp(...jids: string[]): Promise<{ jid: string; exists: unknown }[] | undefined>;
+  sendMessage(jid: string, content: { text: string }): Promise<proto.WebMessageInfo | undefined>;
+  logout(): Promise<void>;
+  end(error: Error | undefined): void;
+}
+
+export interface AuthHandle {
+  state: AuthenticationState;
+  saveCreds: () => Promise<void>;
+}
+
+export interface SocketConfig {
+  auth: AuthenticationState;
+  logger: LibraryLogger;
+  version?: WAVersion;
+  getMessage: (key: proto.IMessageKey) => Promise<proto.IMessage | undefined>;
+}
+
+/** Everything with side effects, injectable so the wiring is tested without WhatsApp. */
+export interface BaileysDeps {
+  loadAuthState(dir: string): Promise<AuthHandle>;
+  makeSocket(config: SocketConfig): SocketLike;
+  fetchVersion(): Promise<{ version: number[]; isLatest: boolean }>;
+  now(): number;
+  /** Start a timer; the returned function cancels it. */
+  setTimer(fn: () => void, ms: number): () => void;
+}
+
+const VERSION_FETCH_TIMEOUT_MS = 5000;
+
+export const realDeps: BaileysDeps = {
+  loadAuthState: (dir) => useMultiFileAuthState(dir),
+  makeSocket: (config) =>
+    makeWASocket({
+      auth: {
+        creds: config.auth.creds,
+        keys: makeCacheableSignalKeyStore(config.auth.keys, config.logger),
+      },
+      logger: config.logger,
+      browser: Browsers.ubuntu('KampusPing'),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      getMessage: config.getMessage,
+      ...(config.version ? { version: config.version } : {}),
+    }),
+  fetchVersion: () => fetchLatestBaileysVersion({ timeout: VERSION_FETCH_TIMEOUT_MS }),
+  now: () => Date.now(),
+  setTimer: (fn, ms) => {
+    const timer = setTimeout(fn, ms);
+    return () => clearTimeout(timer);
+  },
+};
 
 export interface BaileysClientOptions {
   authDir: string;
@@ -153,15 +290,31 @@ export interface BaileysClientOptions {
   baileysLogLevel: BaileysLogLevel;
   reconnectBaseMs?: number;
   reconnectCapMs?: number;
+  deps?: BaileysDeps;
 }
 
 const JID_CACHE_TTL_MS = 10 * 60 * 1000;
-const VERSION_FETCH_TIMEOUT_MS = 5000;
+
+const TERMINAL_HINTS: Record<TerminalReason, string> = {
+  logged_out:
+    'WhatsApp session was logged out (unlinked on the phone). Not reconnecting. Pair again with ' +
+    'POST /logout (the disconnect action in the KampusPing settings), which shows a new QR code.',
+  replaced:
+    'WhatsApp session was taken over by another connection with the same credentials (another ' +
+    'gateway process or a restored auth_state copy?). Not reconnecting. Stop the other one, then ' +
+    'restart this gateway.',
+  forbidden:
+    'WhatsApp refused the session (the number may be restricted or banned). Not reconnecting. ' +
+    'Check the phone before restarting the gateway or pairing again.',
+};
 
 export function createBaileysClient(options: BaileysClientOptions): WaClient {
   const { authDir, logger } = options;
-  const reconnectBaseMs = options.reconnectBaseMs ?? 2000;
-  const reconnectCapMs = options.reconnectCapMs ?? 5 * 60 * 1000;
+  const deps = options.deps ?? realDeps;
+  const policy: ReconnectPolicy = {
+    baseMs: options.reconnectBaseMs ?? 2000,
+    capMs: options.reconnectCapMs ?? 5 * 60 * 1000,
+  };
   const libraryLogger = createBaileysLogger(logger, options.baileysLogLevel);
 
   const handlers: ((event: GatewayEvent) => void)[] = [];
@@ -170,13 +323,13 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   // Recently sent messages, so Baileys can re-encrypt them when a recipient asks for a retry.
   const sentMessages = new BoundedMap<string, proto.IMessage>(500);
 
-  let sock: WASocket | undefined;
+  let sock: SocketLike | undefined;
   let generation = 0;
   let snapshot: ClientSnapshot = { state: 'disconnected', qr: null };
-  let reconnectAttempt = 0;
-  let reconnectTimer: NodeJS.Timeout | undefined;
+  let reconnect: ReconnectState = INITIAL_RECONNECT_STATE;
+  let cancelReconnect: (() => void) | undefined;
   let stopped = false;
-  let version: [number, number, number] | undefined;
+  let version: WAVersion | undefined;
 
   const emit = (event: GatewayEvent): void => {
     for (const handler of handlers) {
@@ -197,59 +350,59 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     }
   };
 
-  const resolveVersion = async (): Promise<[number, number, number] | undefined> => {
+  const resolveVersion = async (): Promise<WAVersion | undefined> => {
     if (version) return version;
     try {
-      const latest = await fetchLatestBaileysVersion({ timeout: VERSION_FETCH_TIMEOUT_MS });
-      if (latest.isLatest) version = latest.version;
+      const latest = await deps.fetchVersion();
+      const triple = latest.version as WAVersion;
+      if (latest.isLatest) version = triple;
       logger.info(
         { wa_version: latest.version.join('.'), latest: latest.isLatest },
         'WhatsApp Web version selected',
       );
-      return latest.version;
+      return triple;
     } catch {
       return undefined; // Baileys falls back to its bundled version
     }
   };
 
   const clearReconnect = (): void => {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = undefined;
+    cancelReconnect?.();
+    cancelReconnect = undefined;
   };
 
   const scheduleReconnect = (delayMs: number): void => {
     clearReconnect();
     logger.info({ in_ms: delayMs }, 'reconnecting to WhatsApp');
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = undefined;
+    cancelReconnect = deps.setTimer(() => {
+      cancelReconnect = undefined;
       connect().catch((error: unknown) => {
         logger.error({ err_type: (error as Error).name }, 'reconnect failed');
-        scheduleReconnect(reconnectDelayMs(reconnectAttempt++, reconnectBaseMs, reconnectCapMs));
+        const plan = planAfterClose(undefined, reconnect, deps.now(), policy);
+        reconnect = plan.next;
+        if (plan.action.kind === 'reconnect') scheduleReconnect(plan.action.delayMs);
       });
     }, delayMs);
   };
 
   const onConnectionUpdate = (update: Partial<ConnectionState>): void => {
     setSnapshot(nextSnapshot(snapshot, update));
-    if (update.connection === 'open') reconnectAttempt = 0;
+    if (update.connection === 'open') reconnect = { ...reconnect, openedAt: deps.now() };
     if (update.connection !== 'close') return;
 
     sock = undefined;
-    const error = update.lastDisconnect?.error;
-    const decision = closeDecision(error);
-    logger.warn({ code: disconnectCode(error), decision }, 'WhatsApp connection closed');
+    const code = disconnectCode(update.lastDisconnect?.error);
+    const plan = planAfterClose(code, reconnect, deps.now(), policy);
+    reconnect = plan.next;
     if (stopped) return;
-    if (decision === 'logged_out') {
-      logger.warn(
-        'WhatsApp session was logged out (unlinked on the phone). Pair again with POST /logout ' +
-          '(the "disconnect" action in the KampusPing settings), which shows a new QR code.',
-      );
+    const { action } = plan;
+    if (action.kind === 'terminal') {
+      // One warning per terminal close, reason code only.
+      logger.warn({ code, reason: action.reason }, TERMINAL_HINTS[action.reason]);
       return;
     }
-    const delay =
-      decision === 'restart_now'
-        ? 0
-        : reconnectDelayMs(reconnectAttempt++, reconnectBaseMs, reconnectCapMs);
+    const delay = action.kind === 'restart_now' ? 0 : action.delayMs;
+    logger.warn({ code, retry_in_ms: delay }, 'WhatsApp connection closed');
     scheduleReconnect(delay);
   };
 
@@ -257,16 +410,13 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     generation += 1;
     const current = generation;
     await mkdir(authDir, { recursive: true, mode: 0o700 });
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { state, saveCreds } = await deps.loadAuthState(authDir);
     const waVersion = await resolveVersion();
     if (current !== generation || stopped) return; // superseded meanwhile
 
-    const socket = makeWASocket({
-      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, libraryLogger) },
+    const socket = deps.makeSocket({
+      auth: state,
       logger: libraryLogger,
-      browser: Browsers.ubuntu('KampusPing'),
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
       getMessage: (key) => Promise.resolve(key.id ? sentMessages.get(key.id) : undefined),
       ...(waVersion ? { version: waVersion } : {}),
     });
@@ -291,16 +441,16 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     // messages.upsert (inbound replies) is handled in milestone M3; nothing is subscribed here.
   }
 
-  const lookupJid = async (socket: WASocket, phone: string): Promise<string | undefined> => {
+  const lookupJid = async (socket: SocketLike, phone: string): Promise<string | undefined> => {
     const cached = jidCache.get(phone);
-    if (cached && Date.now() - cached.at < JID_CACHE_TTL_MS) return cached.jid;
+    if (cached && deps.now() - cached.at < JID_CACHE_TTL_MS) return cached.jid;
     const [result] = (await socket.onWhatsApp(phoneToJid(phone))) ?? [];
     if (!result?.exists || typeof result.jid !== 'string') return undefined;
-    jidCache.set(phone, { jid: result.jid, at: Date.now() });
+    jidCache.set(phone, { jid: result.jid, at: deps.now() });
     return result.jid;
   };
 
-  const connectedSocket = (): WASocket => {
+  const connectedSocket = (): SocketLike => {
     if (!sock || snapshot.state !== 'connected') throw new DisconnectedError();
     return sock;
   };
@@ -370,7 +520,7 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
       sentMessages.clear();
       setSnapshot({ state: 'disconnected', qr: null });
       logger.info('WhatsApp session wiped; starting over for a new QR code');
-      reconnectAttempt = 0;
+      reconnect = INITIAL_RECONNECT_STATE;
       if (!stopped) await connect();
     },
 

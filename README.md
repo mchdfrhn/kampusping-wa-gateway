@@ -134,9 +134,22 @@ Generate secrets with e.g. `openssl rand -hex 32`.
    goes `connecting` then `connected` (a restart requested by WhatsApp right after pairing is
    handled automatically).
 
-To switch numbers or re-pair, use the disconnect action in the UI (`POST /logout`). If the device
-is unlinked from the phone, the gateway stays `disconnected` (it does not reconnect after a
-logout) until `POST /logout` is called, which wipes the old session and shows a new QR.
+To switch numbers or re-pair, use the disconnect action in the UI (`POST /logout`).
+
+Reconnecting is deliberately conservative, because rapid repeated logins are what gets a number
+banned:
+
+- Ordinary drops reconnect with exponential backoff (2 s, 4 s, 8 s, ... up to 5 min). The backoff
+  only starts over after a connection stayed open for 60 s, so a flapping connection keeps
+  slowing down.
+- `restartRequired` (sent right after pairing) restarts at once, at most 3 times in a row.
+- These closes are **terminal**; the gateway stays `disconnected` and logs one warning:
+  - logged out (device unlinked on the phone): recover with `POST /logout`, which shows a new QR;
+  - connection replaced (another process uses the same session): stop the other process, then
+    restart the gateway;
+  - forbidden (number restricted or banned): check the phone first.
+- **Never run a restored copy of `auth_state/` while production is running** (another host, a
+  test machine): both would hold the same session and kick each other off.
 
 ## Data on disk: protect and back up
 
