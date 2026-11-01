@@ -214,4 +214,115 @@ describe('webhook sender', () => {
     await scheduler.runAll();
     await sender.idle();
   });
+
+  it('test_each_attempt_times_out_even_if_fetch_never_settles', async () => {
+    const scheduler = new FakeScheduler();
+    const signals: AbortSignal[] = [];
+    let calls = 0;
+    const fetchFn = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      calls += 1;
+      signals.push(init!.signal!);
+      // First attempt: a fetch that ignores its signal and never settles.
+      if (calls === 1) return new Promise<Response>(() => undefined);
+      return Promise.resolve(new Response(null, { status: 202 }));
+    });
+    const sender = createWebhookSender({
+      url: URL_,
+      secret: SECRET,
+      fetch: fetchFn,
+      scheduler,
+      timeoutMs: 30,
+      logger: silentLogger(),
+    });
+    sender.enqueue(delivered('A'));
+    await vi.waitFor(() => expect(scheduler.sleeps).toEqual([1000]), { timeout: 2000 });
+    expect(signals[0]!.aborted).toBe(true);
+    await scheduler.advance(1000);
+    await sender.idle();
+    expect(calls).toBe(2);
+  });
+
+  it('test_delivered_status_is_replayed_once_after_the_replay_delay', async () => {
+    const scheduler = new FakeScheduler();
+    const { fetchFn, calls } = fakeFetch();
+    const sender = createWebhookSender({
+      url: URL_,
+      secret: SECRET,
+      fetch: fetchFn,
+      scheduler,
+      replayMs: 30_000,
+      logger: silentLogger(),
+    });
+    sender.enqueue(delivered('A'));
+    sender.enqueue({ type: 'connection', state: 'connected' });
+    await scheduler.advance(0);
+    expect(calls).toHaveLength(2);
+    await scheduler.advance(29_999);
+    expect(calls).toHaveLength(2);
+    await scheduler.advance(1);
+    expect(calls).toHaveLength(3);
+    // Same signed bytes, same event; connection events are not replayed; a replay is not replayed.
+    expect(calls[2]!.body.equals(calls[0]!.body)).toBe(true);
+    expect(calls[2]!.headers['x-signature']).toBe(calls[0]!.headers['x-signature']);
+    await scheduler.runAll();
+    expect(calls).toHaveLength(3);
+  });
+
+  it('test_replay_is_skipped_when_disabled_or_when_delivery_failed', async () => {
+    const scheduler = new FakeScheduler();
+    const off = fakeFetch();
+    const disabled = createWebhookSender({
+      url: URL_,
+      secret: SECRET,
+      fetch: off.fetchFn,
+      scheduler,
+      replayMs: 0,
+      logger: silentLogger(),
+    });
+    disabled.enqueue(delivered('A'));
+    await scheduler.runAll();
+    expect(off.calls).toHaveLength(1);
+
+    const failing = fakeFetch([], 500);
+    const sender = createWebhookSender({
+      url: URL_,
+      secret: SECRET,
+      fetch: failing.fetchFn,
+      scheduler,
+      retries: 1,
+      replayMs: 30_000,
+      logger: silentLogger(),
+    });
+    sender.enqueue(delivered('B'));
+    await scheduler.runAll();
+    expect(failing.calls).toHaveLength(2); // first attempt + 1 retry, no replay of a dropped event
+  });
+
+  it('test_pending_replays_are_bounded_and_dropped_on_stop', async () => {
+    const scheduler = new FakeScheduler();
+    const { fetchFn, calls } = fakeFetch();
+    const sender = createWebhookSender({
+      url: URL_,
+      secret: SECRET,
+      fetch: fetchFn,
+      scheduler,
+      replayMs: 30_000,
+      maxPendingReplays: 1,
+      logger: silentLogger(),
+    });
+    sender.enqueue(delivered('A'));
+    sender.enqueue(delivered('B'));
+    await scheduler.advance(30_000);
+    expect(calls.map((call) => call.event)).toEqual([
+      delivered('A'),
+      delivered('B'),
+      delivered('A'),
+    ]);
+
+    sender.enqueue(read('C'));
+    await scheduler.advance(0);
+    sender.stop();
+    await scheduler.runAll();
+    expect(calls).toHaveLength(4); // C delivered once, its replay dropped by stop()
+  });
 });

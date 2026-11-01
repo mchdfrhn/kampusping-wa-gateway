@@ -19,12 +19,14 @@ async function startClient(
   dir: string,
   logger = silentLogger(),
   fakeOptions: FakeDepsOptions = {},
+  fetchWaVersion = true,
 ) {
   const fake = fakeBaileysDeps(fakeOptions);
   const client = createBaileysClient({
     authDir: join(dir, 'auth'),
     logger,
     baileysLogLevel: 'silent',
+    fetchWaVersion,
     deps: fake.deps,
   });
   const events: GatewayEvent[] = [];
@@ -163,6 +165,59 @@ describe('Baileys client wiring', () => {
       await flush();
       expect(saves).toBe(2);
       expect(fake.keyWrites).toEqual([auth]);
+    });
+  });
+
+  async function reconnectOnce(fake: ReturnType<typeof fakeBaileysDeps>, count: number) {
+    fake.sockets.at(-1)!.emit('connection.update', closeWith(DisconnectReason.connectionClosed));
+    fake.fireLast();
+    await fake.waitForSockets(count);
+  }
+
+  it('test_wa_version_fetch_can_be_disabled', async () => {
+    await withTempDir(async (dir) => {
+      const { fake } = await startClient(dir, silentLogger(), {}, false);
+      await reconnectOnce(fake, 2);
+      expect(fake.versionFetches()).toBe(0);
+      expect(fake.versionsUsed).toEqual([undefined, undefined]); // bundled version
+    });
+  });
+
+  it('test_wa_version_is_fetched_once_and_cached', async () => {
+    await withTempDir(async (dir) => {
+      const { fake } = await startClient(dir);
+      await reconnectOnce(fake, 2);
+      expect(fake.versionFetches()).toBe(1);
+      expect(fake.versionsUsed).toEqual([
+        [2, 3000, 1],
+        [2, 3000, 1],
+      ]);
+    });
+  });
+
+  it('test_invalid_wa_version_falls_back_warns_and_is_fetched_again', async () => {
+    await withTempDir(async (dir) => {
+      const { logger, lines } = captureLogger();
+      const { fake } = await startClient(dir, logger, {
+        fetchVersion: () => Promise.resolve({ version: [2, 3000], isLatest: true }),
+      });
+      await reconnectOnce(fake, 2);
+      expect(fake.versionFetches()).toBe(2);
+      expect(fake.versionsUsed).toEqual([undefined, undefined]);
+      expect(lines.some((line) => line.includes('"level":40') && line.includes('invalid'))).toBe(
+        true,
+      );
+    });
+  });
+
+  it('test_failed_wa_version_fetch_uses_the_bundled_version_without_refetching', async () => {
+    await withTempDir(async (dir) => {
+      const { fake } = await startClient(dir, silentLogger(), {
+        fetchVersion: () => Promise.resolve({ version: [2, 3000, 1], isLatest: false }),
+      });
+      await reconnectOnce(fake, 2);
+      expect(fake.versionFetches()).toBe(1);
+      expect(fake.versionsUsed).toEqual([undefined, undefined]);
     });
   });
 });

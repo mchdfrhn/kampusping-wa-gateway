@@ -45,7 +45,17 @@ describe('loadConfig', () => {
       webhookTimeoutMs: 10000,
       logLevel: 'info',
       baileysLogLevel: 'warn',
+      fetchWaVersion: true,
+      statusReplayMs: 30000,
     });
+    expect(
+      loadConfig(env({ WA_FETCH_WA_VERSION: 'false', WA_STATUS_REPLAY_MS: '0' })),
+    ).toMatchObject({
+      fetchWaVersion: false,
+      statusReplayMs: 0,
+    });
+    expect(problems({ WA_STATUS_REPLAY_MS: '-5' }).join()).toMatch(/WA_STATUS_REPLAY_MS/);
+    expect(problems({ WA_FETCH_WA_VERSION: 'sometimes' }).join()).toMatch(/WA_FETCH_WA_VERSION/);
   });
 
   it('test_config_rejects_non_loopback_host_weak_key_and_bad_url', () => {

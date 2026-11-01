@@ -33,12 +33,17 @@ All versions are exact (no `^`). Notes on Baileys 6.7.24:
   commit in `package-lock.json`). The lockfile records a `git+ssh` URL, but npm downloads public
   GitHub dependencies as an HTTPS tarball, so `npm ci` works without SSH keys (checked) as long as
   github.com is reachable. `libsignal` is **GPL-3.0** licensed.
-- At startup it asks GitHub (`raw.githubusercontent.com`) for the current WhatsApp Web version
-  (`fetchLatestBaileysVersion`, 5 s timeout) and falls back to the bundled version when that
-  fails. If pairing keeps failing with "Connection Failure" (405), update Baileys.
+- WhatsApp Web version (`WA_FETCH_WA_VERSION`): by default the gateway asks GitHub
+  (`raw.githubusercontent.com`, `fetchLatestBaileysVersion`, 5 s timeout) once per process for the
+  current WhatsApp Web version. Only three positive integers are accepted. An invalid answer is
+  ignored with a warning (and asked again on the next connect); a failed fetch uses the version
+  bundled with Baileys for the rest of the process. The trade-off: fetching stays current when
+  WhatsApp retires old versions (pairing failing with "Connection Failure", 405), while
+  `WA_FETCH_WA_VERSION=false` is reproducible and makes no network call, but the bundled version
+  ages until Baileys is updated.
 
-Node 20 or newer (`process.loadEnvFile`, used for `.env`, needs Node 20.12+; on older Node set the
-variables in the environment).
+Node **20.19 or newer** (`engines.node`): `.env` loading uses `process.loadEnvFile`, and the lint
+tooling (ESLint 10) needs 20.19.
 
 ## HTTP API
 
@@ -73,8 +78,11 @@ pruned on start and hourly.
   at-least-once in that window, exactly-once otherwise. If the write fails (disk full), the send
   still answers `200` and the ref is remembered in memory until the next restart (logged as an
   error).
-- A missing store starts empty; an unreadable one starts empty with a warning and is kept as
-  `<file>.corrupt`.
+- A missing store starts empty. A store that is not valid JSON starts empty with a warning and is
+  kept as `<file>.corrupt`. Any other read error (permissions, a directory in its place, I/O
+  errors) **stops startup** with a clear message, so a store that is only temporarily unreadable
+  is never overwritten with an empty one. Leftover `<file>.*.tmp` files from an interrupted write
+  are removed on start, and the folder is fsynced after every rename (where supported).
 
 ## Webhook to the backend
 
@@ -94,7 +102,13 @@ pruned on start and hourly.
   them again). So a receipt is sent no earlier than `WA_STATUS_DELAY_MS` (default 2 s) after the
   answer to the send that produced the id. If the same `client_ref` is asked again (the worker lost
   the first answer), the latest receipt is sent once more after the delay.
-- **Retries.** Network errors, timeouts and every non-2xx answer (redirects are not followed) are
+- **Replays.** If the backend's commit took longer than that delay, the first copy was dropped. So
+  every `status` event that was delivered is sent **once more** `WA_STATUS_REPLAY_MS` later
+  (default 30 s, `0` turns it off), through the same ordered, signed and retried path. The backend
+  ignores stale and duplicate receipts, so replays are harmless. At most 1000 replays wait at a
+  time; pending replays are dropped on shutdown.
+- **Retries.** Network errors, timeouts (`WA_WEBHOOK_TIMEOUT_MS` per attempt, enforced even if the
+  connection hangs) and every non-2xx answer (redirects are not followed) are
   retried `WA_WEBHOOK_RETRIES` times (default 5) with exponential backoff from
   `WA_WEBHOOK_RETRY_BASE_MS` (1 s, 2 s, 4 s, 8 s, 16 s). The same signed bytes are resent.
 - **Ordering.** Events of one message are delivered strictly in order (`read` never overtakes
@@ -119,11 +133,13 @@ environment variables win). Startup fails with a clear list of problems when som
 | `WA_WEBHOOK_RETRY_BASE_MS`   | `1000`                  | First retry delay; doubles on every retry.                                                                                                                                     |
 | `WA_WEBHOOK_TIMEOUT_MS`      | `10000`                 | Per attempt.                                                                                                                                                                   |
 | `WA_STATUS_DELAY_MS`         | `2000`                  | Minimum delay between a send answer and its receipts (500-60000).                                                                                                              |
+| `WA_STATUS_REPLAY_MS`        | `30000`                 | One replay of every delivered receipt after this delay; `0` turns replays off (0-600000).                                                                                      |
 | `WA_AUTH_DIR`                | `./auth_state`          | Baileys session. Refused at startup when it is a filesystem root, the working directory or a parent of it, the home directory or a parent of it, or contains `WA_DEDUPE_FILE`. |
 | `WA_DEDUPE_FILE`             | `./data/sent-refs.json` | `client_ref` store.                                                                                                                                                            |
 | `WA_DEDUPE_TTL_DAYS`         | `14`                    | 14-365.                                                                                                                                                                        |
 | `LOG_LEVEL`                  | `info`                  | Gateway log level.                                                                                                                                                             |
 | `WA_BAILEYS_LOG_LEVEL`       | `warn`                  | Baileys log level: `silent`, `fatal`, `error`, `warn` or `info` (verbose levels log content).                                                                                  |
+| `WA_FETCH_WA_VERSION`        | `true`                  | Fetch the current WhatsApp Web version from GitHub once per process; `false` uses the bundled version without any network call.                                                |
 
 Generate secrets with e.g. `openssl rand -hex 32`.
 
@@ -166,9 +182,13 @@ banned:
 - Both are in `.gitignore`; never commit them and keep them out of any web root.
 - Owned by the PM2 user, mode `700` (the gateway creates `auth_state/` with `0700` and files
   in `data/` with `0600`): `chmod -R go-rwx auth_state data`.
-- Back both up together (e.g. nightly, stop not required), encrypted, with the same care as other
-  secrets. Restoring `auth_state/` brings back the session without a new QR, unless WhatsApp has
-  unlinked the device meanwhile.
+- Back both up together, encrypted, with the same care as other secrets. **Stop the gateway first**
+  (or take an atomic filesystem snapshot): Baileys rewrites key files while it runs, so a file-by-file
+  copy of a running gateway can capture an inconsistent set of keys. Restoring `auth_state/` brings
+  back the session without a new QR, unless WhatsApp has unlinked the device meanwhile.
+- A restored copy must **never run alongside production** (on another host or a test machine):
+  both would hold the same session, and the gateway stops for good when its session is taken
+  over ("connection replaced").
 - Baileys documents `useMultiFileAuthState` (used here) as a reference store rather than one for
   heavy production use; at one number and a few hundred messages a day it is adequate. Keep the
   path configurable (`WA_AUTH_DIR`) on a local disk, not a network share.
@@ -201,7 +221,7 @@ bash deploy/deploy-prod.sh   # npm ci, build, (re)start PM2, check that /status 
 ```
 
 `deploy/ecosystem.prod.config.js` is CommonJS (`deploy/package.json` sets `"type": "commonjs"`
-because the project itself is ESM). Stopping the process closes the socket and gives queued
+because the project itself is ESM). Stopping the process closes the socket, then gives held receipts and queued
 webhooks up to 5 s.
 
 ## Privacy

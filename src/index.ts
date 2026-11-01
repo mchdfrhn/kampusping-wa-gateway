@@ -11,7 +11,7 @@ import { createLogger } from './logging.js';
 import { createGateway } from './server.js';
 
 function loadDotEnv(): void {
-  // process.loadEnvFile exists from Node 20.12; it never overrides variables already set.
+  // process.loadEnvFile (Node >= 20.12; engines requires 20.19) never overrides variables already set.
   if (existsSync('.env') && typeof process.loadEnvFile === 'function') process.loadEnvFile('.env');
 }
 
@@ -33,6 +33,7 @@ async function main(): Promise<void> {
     authDir: config.authDir,
     logger,
     baileysLogLevel: config.baileysLogLevel,
+    fetchWaVersion: config.fetchWaVersion,
   });
   const gateway = await createGateway({ config, client, logger });
 

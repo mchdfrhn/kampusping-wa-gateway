@@ -1,8 +1,8 @@
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { openDedupeStore } from './dedupe.js';
+import { openDedupeStore, syncDirectoryBestEffort } from './dedupe.js';
 import { captureLogger, silentLogger, withTempDir } from './test/fakes.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -108,6 +108,50 @@ describe('dedupe store', () => {
       const store = await openDedupeStore({ file, ttlDays: 14, logger: silentLogger() });
       expect(store.size()).toBe(1);
       expect(store.get('good')?.provider_message_id).toBe('wamid-1');
+    });
+  });
+
+  it('test_dedupe_read_error_other_than_missing_fails_startup', async () => {
+    await withTempDir(async (dir) => {
+      const file = join(dir, 'sent-refs.json');
+      await mkdir(file); // reading a directory fails with EISDIR
+      await expect(openDedupeStore({ file, ttlDays: 14, logger: silentLogger() })).rejects.toThrow(
+        /cannot be read \(EISDIR\)/,
+      );
+      // Nothing was overwritten.
+      expect((await stat(file)).isDirectory()).toBe(true);
+    });
+  });
+
+  it('test_dedupe_cleans_up_stale_temp_files', async () => {
+    await withTempDir(async (dir) => {
+      const file = join(dir, 'sent-refs.json');
+      await writeFile(`${file}.4242.tmp`, 'half written', 'utf8');
+      await writeFile(join(dir, 'other.tmp'), 'not ours', 'utf8');
+      const store = await openDedupeStore({ file, ttlDays: 14, logger: silentLogger() });
+      expect(store.size()).toBe(0);
+      expect((await readdir(dir)).sort()).toEqual(['other.tmp']);
+    });
+  });
+
+  it('test_dedupe_syncs_the_parent_directory_after_each_rename', async () => {
+    await withTempDir(async (dir) => {
+      const file = join(dir, 'sent-refs.json');
+      const synced: string[] = [];
+      const store = await openDedupeStore({
+        file,
+        ttlDays: 14,
+        logger: silentLogger(),
+        syncDirectory: (path) => {
+          synced.push(path);
+          return Promise.resolve();
+        },
+      });
+      await store.record('msg-1', 'wamid-1');
+      await store.record('msg-2', 'wamid-2');
+      expect(synced).toEqual([dir, dir]);
+      // The real directory fsync is best effort (unsupported on some platforms) and never throws.
+      await expect(syncDirectoryBestEffort(dir)).resolves.toBeUndefined();
     });
   });
 });

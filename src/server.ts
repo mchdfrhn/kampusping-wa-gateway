@@ -22,6 +22,8 @@ export interface GatewayDeps {
   logger: Logger;
   fetch?: typeof fetch;
   scheduler?: Scheduler;
+  /** Longest wait in close() for held receipts and queued webhooks (default 5000 ms). */
+  shutdownFlushMs?: number;
 }
 
 export interface Gateway {
@@ -31,7 +33,10 @@ export interface Gateway {
   webhook: WebhookSender;
   /** Listen on GATEWAY_HOST:GATEWAY_PORT, then start the WhatsApp client. */
   listen(): Promise<string>;
-  /** Stop accepting requests, close the WhatsApp socket, give queued webhooks a moment. */
+  /**
+   * Stop accepting requests, close the WhatsApp socket, then wait (at most shutdownFlushMs) for
+   * the relay to release held receipts and the webhook queue to drain; pending replays are dropped.
+   */
   close(): Promise<void>;
 }
 
@@ -52,6 +57,7 @@ export async function createGateway(deps: GatewayDeps): Promise<Gateway> {
     retries: config.webhookRetries,
     baseDelayMs: config.webhookRetryBaseMs,
     timeoutMs: config.webhookTimeoutMs,
+    replayMs: config.statusReplayMs,
     ...(deps.fetch ? { fetch: deps.fetch } : {}),
   });
   const relay = createEventRelay({
@@ -90,12 +96,16 @@ export async function createGateway(deps: GatewayDeps): Promise<Gateway> {
       await client.stop?.();
       let flushTimer: NodeJS.Timeout | undefined;
       await Promise.race([
-        webhook.idle(),
+        (async () => {
+          await relay.idle(); // held receipts are handed to the webhook queue...
+          await webhook.idle(); // ...which then drains
+        })(),
         new Promise<void>((resolve) => {
-          flushTimer = setTimeout(resolve, SHUTDOWN_FLUSH_MS);
+          flushTimer = setTimeout(resolve, deps.shutdownFlushMs ?? SHUTDOWN_FLUSH_MS);
         }),
       ]);
       clearTimeout(flushTimer);
+      webhook.stop();
     },
   };
 }

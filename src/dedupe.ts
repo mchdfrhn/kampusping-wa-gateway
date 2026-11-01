@@ -6,12 +6,15 @@
  * small JSON file rewritten atomically (temp file, fsync, rename) on every change; at the
  * expected volume (hundreds of messages a day, 14 days retained) that is a few hundred KB.
  *
- * A missing file starts empty. An unreadable file starts empty with a warning and is kept aside
- * as `<file>.corrupt` for inspection. Entries older than the TTL are ignored, pruned on load and
- * by `prune()` (called periodically by the server).
+ * A missing file starts empty. A file that is not valid JSON starts empty with a warning and is
+ * kept aside as `<file>.corrupt`. Any other read error (EACCES, EISDIR, EIO, ...) fails startup:
+ * starting empty would overwrite a store that is only temporarily unreadable. Leftover
+ * `<file>.*.tmp` files from an interrupted write are removed on load. After each rename the
+ * parent directory is fsynced (best effort: not supported everywhere, e.g. Windows). Entries
+ * older than the TTL are ignored, pruned on load and by `prune()` (called periodically).
  */
-import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import type { Logger } from 'pino';
 
 export interface DedupeRecord {
@@ -41,6 +44,8 @@ export interface DedupeOptions {
   ttlDays: number;
   logger: Logger;
   now?: () => number;
+  /** fsync of the parent directory after a rename (injectable for tests). */
+  syncDirectory?: (dir: string) => Promise<void>;
 }
 
 interface FileShape {
@@ -53,6 +58,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export async function openDedupeStore(options: DedupeOptions): Promise<DedupeStore> {
   const { file, logger } = options;
   const now = options.now ?? (() => Date.now());
+  const syncDirectory = options.syncDirectory ?? syncDirectoryBestEffort;
   const ttlMs = options.ttlDays * DAY_MS;
   const entries = new Map<string, DedupeRecord>();
   const messageIds = new Set<string>();
@@ -69,7 +75,7 @@ export async function openDedupeStore(options: DedupeOptions): Promise<DedupeSto
     const snapshot: FileShape = { version: 1, entries: Object.fromEntries(entries) };
     const body = JSON.stringify(snapshot);
     // Serialise writes so two renames never race; each write stores the latest snapshot.
-    const next = writing.then(() => writeAtomically(file, body));
+    const next = writing.then(() => writeAtomically(file, body, syncDirectory));
     writing = next.catch(() => undefined);
     return next;
   };
@@ -87,6 +93,7 @@ export async function openDedupeStore(options: DedupeOptions): Promise<DedupeSto
   };
 
   await mkdir(dirname(file), { recursive: true });
+  await removeStaleTempFiles(file, logger);
   const loaded = await readEntries(file, logger);
   for (const [ref, record] of loaded) entries.set(ref, record);
   rebuildIds();
@@ -129,10 +136,13 @@ async function readEntries(file: string, logger: Logger): Promise<Loaded> {
   try {
     raw = await readFile(file, 'utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      logger.warn({ code: (error as NodeJS.ErrnoException).code }, 'dedupe store unreadable');
-    }
-    return result;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return result;
+    throw new Error(
+      `dedupe store ${file} cannot be read (${code ?? 'unknown error'}); refusing to start ` +
+        'with an empty store that would overwrite it. Fix the file or its permissions.',
+      { cause: error },
+    );
   }
 
   let parsed: unknown;
@@ -169,7 +179,36 @@ async function readEntries(file: string, logger: Logger): Promise<Loaded> {
   return result;
 }
 
-async function writeAtomically(file: string, body: string): Promise<void> {
+const UNSUPPORTED_DIR_SYNC = new Set(['EPERM', 'EINVAL', 'EISDIR', 'EBADF', 'ENOTSUP', 'EACCES']);
+
+/** fsync a directory so a rename inside it survives a power loss; a no-op where unsupported. */
+export async function syncDirectoryBestEffort(dir: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(dir, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (!UNSUPPORTED_DIR_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function removeStaleTempFiles(file: string, logger: Logger): Promise<void> {
+  const prefix = `${basename(file)}.`;
+  for (const entry of await readdir(dirname(file))) {
+    if (entry.startsWith(prefix) && entry.endsWith('.tmp')) {
+      await rm(join(dirname(file), entry), { force: true });
+      logger.warn('removed a leftover temp file of the dedupe store');
+    }
+  }
+}
+
+async function writeAtomically(
+  file: string,
+  body: string,
+  syncDirectory: (dir: string) => Promise<void>,
+): Promise<void> {
   const temp = `${file}.${process.pid}.tmp`;
   const handle = await open(temp, 'w', 0o600);
   try {
@@ -184,6 +223,7 @@ async function writeAtomically(file: string, body: string): Promise<void> {
     await rm(temp, { force: true });
     throw error;
   }
+  await syncDirectory(dirname(file));
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

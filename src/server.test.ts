@@ -101,4 +101,74 @@ describe('gateway composition', () => {
       expect(stopped).toBe(1);
     });
   });
+
+  it('test_close_waits_for_held_receipts_and_queued_webhooks', async () => {
+    await withTempDir(async (dir) => {
+      const config = loadConfig({
+        WA_GATEWAY_API_KEY: API_KEY,
+        WA_WEBHOOK_URL: WEBHOOK,
+        WA_WEBHOOK_SECRET: SECRET,
+        WA_DEDUPE_FILE: join(dir, 'sent-refs.json'),
+      });
+      const posted: GatewayEvent[] = [];
+      const fetchFn = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+        posted.push(JSON.parse((init!.body as Buffer).toString('utf8')) as GatewayEvent);
+        return Promise.resolve(new Response(null, { status: 202 }));
+      });
+      const scheduler = new FakeScheduler();
+      const client = new FakeClient();
+      const gateway = await createGateway({
+        config,
+        client,
+        logger: silentLogger(),
+        fetch: fetchFn,
+        scheduler,
+      });
+      await gateway.app.inject({
+        method: 'POST',
+        url: '/messages',
+        headers: { authorization: `Bearer ${API_KEY}` },
+        payload: { to: '+6281234567890', text: 'Halo', client_ref: 'msg-1' },
+      });
+      client.emit({ type: 'status', provider_message_id: 'wamid-1', state: 'read' });
+
+      let closed = false;
+      const closing = gateway.close().then(() => {
+        closed = true;
+      });
+      await scheduler.advance(1000);
+      expect(closed).toBe(false); // the receipt is still held by the relay
+      await scheduler.advance(1000);
+      await closing;
+      expect(posted).toEqual([{ type: 'status', provider_message_id: 'wamid-1', state: 'read' }]);
+      // The replay that was scheduled after delivery is dropped by close().
+      await scheduler.runAll();
+      expect(posted).toHaveLength(1);
+    });
+  });
+
+  it('test_close_gives_up_draining_after_the_cap', async () => {
+    await withTempDir(async (dir) => {
+      const config = loadConfig({
+        WA_GATEWAY_API_KEY: API_KEY,
+        WA_WEBHOOK_URL: WEBHOOK,
+        WA_WEBHOOK_SECRET: SECRET,
+        WA_DEDUPE_FILE: join(dir, 'sent-refs.json'),
+      });
+      const scheduler = new FakeScheduler();
+      const client = new FakeClient();
+      const gateway = await createGateway({
+        config,
+        client,
+        logger: silentLogger(),
+        fetch: () => new Promise<Response>(() => undefined), // backend never answers
+        scheduler,
+        shutdownFlushMs: 50,
+      });
+      client.emit({ type: 'connection', state: 'connected' });
+      const started = Date.now();
+      await gateway.close();
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+  });
 });

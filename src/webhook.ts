@@ -11,6 +11,13 @@
  * never overtakes a `delivered`, while one failing message does not hold up the others. An event
  * that still fails is dropped with a warning that carries no payload. The queue is lost on a
  * restart (documented in the README).
+ *
+ * Every attempt has its own timeout, enforced even if `fetch` ignores its abort signal.
+ *
+ * Replays: after a `status` event was delivered successfully, the same event is sent once more
+ * `replayMs` later (through the same ordered, signed, retried path). That covers a backend whose
+ * outcome commit took longer than the receipt delay, so it dropped the first copy as unknown; the
+ * backend ignores stale or duplicate receipts. Pending replays are bounded and `stop()` drops them.
  */
 import { createHmac } from 'node:crypto';
 import type { Logger } from 'pino';
@@ -32,6 +39,10 @@ export interface WebhookSenderOptions {
   timeoutMs?: number;
   /** Events queued at most (all lanes together); newer events are dropped beyond it. */
   maxQueued?: number;
+  /** Replay each delivered status event once after this delay (default 0 = off). */
+  replayMs?: number;
+  /** Replays waiting at most; further ones are skipped (default 1000). */
+  maxPendingReplays?: number;
 }
 
 export interface WebhookSender {
@@ -39,6 +50,8 @@ export interface WebhookSender {
   /** Resolves once every queued event was delivered or dropped. */
   idle(): Promise<void>;
   queued(): number;
+  /** Drop pending replays (shutdown). Queued events are still delivered. */
+  stop(): void;
 }
 
 /** `sha256=<lowercase hex>` over the exact body bytes, as the backend's `verify_signature`. */
@@ -58,34 +71,72 @@ export function createWebhookSender(options: WebhookSenderOptions): WebhookSende
   const baseDelayMs = options.baseDelayMs ?? 1000;
   const timeoutMs = options.timeoutMs ?? 10_000;
   const maxQueued = options.maxQueued ?? 10_000;
+  const replayMs = options.replayMs ?? 0;
+  const maxPendingReplays = options.maxPendingReplays ?? 1000;
+  let pendingReplays = 0;
+  let stopped = false;
 
-  const lanes = new Map<string, GatewayEvent[]>();
+  interface Queued {
+    event: GatewayEvent;
+    replay: boolean;
+  }
+  const lanes = new Map<string, Queued[]>();
   let total = 0;
   let idleWaiters: (() => void)[] = [];
 
   const attemptOnce = async (body: Buffer, signature: string): Promise<string | null> => {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error('webhook attempt timed out');
+        error.name = 'TimeoutError';
+        controller.abort(error);
+        reject(error);
+      }, timeoutMs);
+      timer.unref();
+    });
     try {
-      const response = await fetchFn(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-signature': signature },
-        body,
-        redirect: 'manual',
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      const response = await Promise.race([
+        fetchFn(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-signature': signature },
+          body,
+          redirect: 'manual',
+          signal: controller.signal,
+        }),
+        timedOut,
+      ]);
       await response.body?.cancel().catch(() => undefined);
       return response.status >= 200 && response.status < 300 ? null : `HTTP ${response.status}`;
     } catch (error) {
       return error instanceof Error ? error.name : 'unknown error';
+    } finally {
+      clearTimeout(timer);
     }
   };
 
-  const deliver = async (event: GatewayEvent): Promise<void> => {
+  const scheduleReplay = (event: GatewayEvent): void => {
+    if (event.type !== 'status' || replayMs <= 0 || stopped) return;
+    if (pendingReplays >= maxPendingReplays) {
+      logger.debug('replay skipped: too many pending replays');
+      return;
+    }
+    pendingReplays += 1;
+    void scheduler.sleep(replayMs).then(() => {
+      pendingReplays -= 1;
+      if (!stopped) push({ event, replay: true });
+    });
+  };
+
+  /** True when delivered, false when dropped after the last retry. */
+  const deliver = async (event: GatewayEvent): Promise<boolean> => {
     const body = Buffer.from(JSON.stringify(event), 'utf8');
     const signature = signBody(secret, body);
     let failure: string | null = null;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       failure = await attemptOnce(body, signature);
-      if (failure === null) return;
+      if (failure === null) return true;
       if (attempt < retries) {
         const delay = baseDelayMs * 2 ** attempt;
         logger.debug(
@@ -99,11 +150,14 @@ export function createWebhookSender(options: WebhookSenderOptions): WebhookSende
       { type: event.type, attempts: retries + 1, outcome: failure },
       'webhook event dropped after the last retry',
     );
+    return false;
   };
 
-  const runLane = async (key: string, lane: GatewayEvent[]): Promise<void> => {
+  const runLane = async (key: string, lane: Queued[]): Promise<void> => {
     while (lane.length > 0) {
-      await deliver(lane[0]!);
+      const { event, replay } = lane[0]!;
+      const delivered = await deliver(event);
+      if (delivered && !replay) scheduleReplay(event);
       lane.shift();
       total -= 1;
     }
@@ -115,22 +169,29 @@ export function createWebhookSender(options: WebhookSenderOptions): WebhookSende
     }
   };
 
+  function push(item: Queued): void {
+    if (total >= maxQueued) {
+      logger.warn({ type: item.event.type }, 'webhook queue full; event dropped');
+      return;
+    }
+    total += 1;
+    const key = laneKey(item.event);
+    const lane = lanes.get(key);
+    if (lane) {
+      lane.push(item);
+      return;
+    }
+    const fresh = [item];
+    lanes.set(key, fresh);
+    void runLane(key, fresh);
+  }
+
   return {
     enqueue(event) {
-      if (total >= maxQueued) {
-        logger.warn({ type: event.type }, 'webhook queue full; event dropped');
-        return;
-      }
-      total += 1;
-      const key = laneKey(event);
-      const lane = lanes.get(key);
-      if (lane) {
-        lane.push(event);
-        return;
-      }
-      const fresh = [event];
-      lanes.set(key, fresh);
-      void runLane(key, fresh);
+      push({ event, replay: false });
+    },
+    stop() {
+      stopped = true;
     },
     idle() {
       if (lanes.size === 0) return Promise.resolve();

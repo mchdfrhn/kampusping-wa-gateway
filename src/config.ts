@@ -21,6 +21,10 @@ export interface GatewayConfig {
   webhookRetryBaseMs: number;
   webhookTimeoutMs: number;
   statusDelayMs: number;
+  /** One replay of every delivered receipt after this delay (0 = off). */
+  statusReplayMs: number;
+  /** Ask GitHub for the current WhatsApp Web version (false = bundled version, no network). */
+  fetchWaVersion: boolean;
   authDir: string;
   dedupeFile: string;
   dedupeTtlDays: number;
@@ -67,12 +71,13 @@ export function loadConfig(env: Env = process.env, context: ConfigContext = {}):
     return value;
   };
 
-  const bool = (name: string): boolean => {
+  const bool = (name: string, fallback = false): boolean => {
     const raw = env[name]?.trim().toLowerCase();
-    if (!raw || raw === 'false' || raw === '0') return false;
+    if (!raw) return fallback;
+    if (raw === 'false' || raw === '0') return false;
     if (raw === 'true' || raw === '1') return true;
     problems.push(`${name} must be "true" or "false".`);
-    return false;
+    return fallback;
   };
 
   const secret = (name: string): string => {
@@ -120,6 +125,8 @@ export function loadConfig(env: Env = process.env, context: ConfigContext = {}):
     webhookRetryBaseMs: int('WA_WEBHOOK_RETRY_BASE_MS', 1000, 100, 60_000),
     webhookTimeoutMs: int('WA_WEBHOOK_TIMEOUT_MS', 10_000, 1000, 60_000),
     statusDelayMs: int('WA_STATUS_DELAY_MS', 2000, 500, 60_000),
+    statusReplayMs: int('WA_STATUS_REPLAY_MS', 30_000, 0, 600_000),
+    fetchWaVersion: bool('WA_FETCH_WA_VERSION', true),
     authDir: text('WA_AUTH_DIR', './auth_state'),
     dedupeFile: text('WA_DEDUPE_FILE', './data/sent-refs.json'),
     // Never shorter than 14 days: the worker may retry a message long after the first attempt.

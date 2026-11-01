@@ -411,6 +411,30 @@ describe('gateway HTTP API', () => {
     });
   });
 
+  it('test_send_answers_only_after_the_dedupe_record_is_written', async () => {
+    await withTempDir(async (dir) => {
+      const { app, dedupe } = await harness(dir);
+      let finishWrite: () => void = () => undefined;
+      const record = dedupe.record.bind(dedupe);
+      dedupe.record = async (...args) => {
+        await new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        });
+        return record(...args);
+      };
+      let answered = false;
+      const pending = send(app, message('msg-w')).then((response) => {
+        answered = true;
+        return response;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(answered).toBe(false); // the write is still running: no answer yet
+      finishWrite();
+      const response = await pending;
+      expect(response.json()).toEqual({ provider_message_id: 'wamid-1' });
+      expect(dedupe.get('msg-w')?.provider_message_id).toBe('wamid-1');
+    });
+  });
   it('test_send_answers_200_when_the_dedupe_write_fails_after_sending', async () => {
     await withTempDir(async (dir) => {
       const { app, client, dedupe } = await harness(dir);

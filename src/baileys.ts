@@ -14,9 +14,8 @@
  *   by `eventFromMessageUpdate` (DELIVERY_ACK -> delivered, READ/PLAYED -> read, ERROR -> failed).
  * - Inbound messages are not handled in this milestone and are never logged.
  *
- * The pure helpers and the wiring (through injectable BaileysDeps and a fake socket) are unit-
- * tested; only 
-ealDeps (the real socket factory) needs a real phone (manual smoke test).
+ * The pure helpers and the wiring (through injectable `BaileysDeps` and a fake socket) are
+ * unit-tested; only `realDeps` (the real socket factory) needs a real phone (manual smoke test).
  */
 import { mkdir } from 'node:fs/promises';
 import makeWASocket, {
@@ -200,6 +199,29 @@ export function planAfterClose(
     },
   };
 }
+export type VersionOutcome = 'fetched' | 'invalid' | 'failed';
+
+/**
+ * Judge the result of `fetchLatestBaileysVersion`. Only three positive integers from a
+ * successful fetch are used (and cached); otherwise the bundled version is used. A failed fetch
+ * (Baileys answers its bundled version with `isLatest: false`) is not treated as "latest".
+ */
+export function pickWaVersion(result: { version: unknown; isLatest: boolean } | Error): {
+  version?: WAVersion;
+  outcome: VersionOutcome;
+} {
+  if (result instanceof Error || !result.isLatest) return { outcome: 'failed' };
+  const { version } = result;
+  if (
+    Array.isArray(version) &&
+    version.length === 3 &&
+    version.every((part) => Number.isSafeInteger(part) && (part as number) > 0)
+  ) {
+    return { version: version as WAVersion, outcome: 'fetched' };
+  }
+  return { outcome: 'invalid' };
+}
+
 class BoundedMap<K, V> {
   private readonly map = new Map<K, V>();
   constructor(private readonly max: number) {}
@@ -290,6 +312,8 @@ export interface BaileysClientOptions {
   baileysLogLevel: BaileysLogLevel;
   reconnectBaseMs?: number;
   reconnectCapMs?: number;
+  /** Ask GitHub for the current WhatsApp Web version (default true); false = bundled, offline. */
+  fetchWaVersion?: boolean;
   deps?: BaileysDeps;
 }
 
@@ -372,6 +396,8 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   let cancelReconnect: (() => void) | undefined;
   let stopped = false;
   let version: WAVersion | undefined;
+  // Fetch at most once per process; only an invalid answer allows another try.
+  let versionSettled = options.fetchWaVersion === false;
   const pendingWrites = new Set<Promise<unknown>>();
   const trackWrite = (write: Promise<unknown>): void => {
     pendingWrites.add(write);
@@ -400,20 +426,26 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     }
   };
 
+  /** undefined = let Baileys use its bundled version. */
   const resolveVersion = async (): Promise<WAVersion | undefined> => {
-    if (version) return version;
+    if (versionSettled) return version;
+    let picked: ReturnType<typeof pickWaVersion>;
     try {
-      const latest = await deps.fetchVersion();
-      const triple = latest.version as WAVersion;
-      if (latest.isLatest) version = triple;
-      logger.info(
-        { wa_version: latest.version.join('.'), latest: latest.isLatest },
-        'WhatsApp Web version selected',
-      );
-      return triple;
-    } catch {
-      return undefined; // Baileys falls back to its bundled version
+      picked = pickWaVersion(await deps.fetchVersion());
+    } catch (error) {
+      picked = pickWaVersion(error instanceof Error ? error : new Error('fetch failed'));
     }
+    if (picked.outcome === 'fetched') {
+      version = picked.version;
+      versionSettled = true;
+      logger.info({ wa_version: version?.join('.') }, 'WhatsApp Web version fetched');
+    } else if (picked.outcome === 'failed') {
+      versionSettled = true; // no retry: keep the bundled version for this process
+      logger.info('WhatsApp Web version fetch failed; using the bundled version');
+    } else {
+      logger.warn('WhatsApp Web version fetch returned an invalid version; using the bundled one');
+    }
+    return version;
   };
 
   const clearReconnect = (): void => {

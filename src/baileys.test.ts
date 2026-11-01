@@ -9,6 +9,7 @@ import {
   DisconnectReason,
   INITIAL_RECONNECT_STATE,
   MAX_CONSECUTIVE_RESTARTS,
+  pickWaVersion,
   planAfterClose,
   type ReconnectState,
   STABLE_CONNECTION_MS,
@@ -198,5 +199,31 @@ describe('Baileys mapping helpers', () => {
     expect(isConnectionError(boom(DisconnectReason.connectionReplaced))).toBe(true);
     expect(isConnectionError(boom(400))).toBe(false);
     expect(isConnectionError(new Error('x'))).toBe(false);
+  });
+
+  it('test_pick_wa_version_accepts_only_three_positive_integers_from_a_successful_fetch', () => {
+    expect(pickWaVersion({ version: [2, 3000, 1023], isLatest: true })).toEqual({
+      version: [2, 3000, 1023],
+      outcome: 'fetched',
+    });
+    for (const bad of [
+      [2, 3000],
+      [2, 3000, 1, 4],
+      [2, -1, 3],
+      [0, 1, 2],
+      [2, 1.5, 3],
+      ['2', 3, 4],
+      null,
+      'x',
+    ]) {
+      expect(pickWaVersion({ version: bad, isLatest: true }), JSON.stringify(bad)).toEqual({
+        outcome: 'invalid',
+      });
+    }
+    // A failed fetch (Baileys answers its bundled version with isLatest false) is not "latest".
+    expect(pickWaVersion({ version: [2, 3000, 1], isLatest: false })).toEqual({
+      outcome: 'failed',
+    });
+    expect(pickWaVersion(new Error('offline'))).toEqual({ outcome: 'failed' });
   });
 });
