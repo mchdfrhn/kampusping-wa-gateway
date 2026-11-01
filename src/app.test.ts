@@ -1,4 +1,5 @@
 import * as crypto from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Logger } from 'pino';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -254,9 +255,92 @@ describe('gateway HTTP API', () => {
       const again = await send(second.app, message('msg-8'));
       expect(again.json()).toEqual({ provider_message_id: 'wamid-1' });
       expect(client.sent).toEqual([]);
+      // The fingerprint is reloaded too: other content under the same ref is still refused.
+      const reused = await send(second.app, { ...message('msg-8'), text: 'lain' });
+      expect(reused.statusCode).toBe(409);
     });
   });
 
+  it('test_reused_client_ref_with_different_text_is_409_and_sends_nothing', async () => {
+    await withTempDir(async (dir) => {
+      const { app, client } = await harness(dir);
+      expect((await send(app, message('msg-1'))).statusCode).toBe(200);
+      const reused = await send(app, {
+        ...message('msg-1'),
+        text: 'Pesan lain untuk mahasiswa lain',
+      });
+      expect(reused.statusCode).toBe(409);
+      expect(reused.json()).toEqual({ error: 'client_ref_conflict' });
+      expect(client.sent).toHaveLength(1);
+
+      // Same ref with the original content still answers the original id.
+      const same = await send(app, message('msg-1'));
+      expect(same.json()).toEqual({ provider_message_id: 'wamid-1' });
+    });
+  });
+
+  it('test_reused_client_ref_with_different_to_is_409', async () => {
+    await withTempDir(async (dir) => {
+      const { app, client } = await harness(dir);
+      await send(app, message('msg-2'));
+      const reused = await send(app, { ...message('msg-2'), to: '+6289999999999' });
+      expect(reused.statusCode).toBe(409);
+      expect(reused.json()).toEqual({ error: 'client_ref_conflict' });
+      expect(client.sent).toHaveLength(1);
+    });
+  });
+
+  it('test_concurrent_reuse_with_different_content_is_409', async () => {
+    await withTempDir(async (dir) => {
+      const { app, client } = await harness(dir);
+      let release: (value: { id: string }) => void = () => undefined;
+      client.sendImpl = () =>
+        new Promise((resolve) => {
+          release = resolve;
+        });
+      const first = send(app, message('msg-3'));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const other = await send(app, { ...message('msg-3'), text: 'beda' });
+      expect(other.statusCode).toBe(409);
+      release({ id: 'wamid-3' });
+      expect((await first).json()).toEqual({ provider_message_id: 'wamid-3' });
+    });
+  });
+
+  it('test_legacy_record_without_fingerprint_dedupes_by_ref_only', async () => {
+    await withTempDir(async (dir) => {
+      const file = join(dir, 'sent-refs.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          version: 1,
+          entries: {
+            'msg-old': { provider_message_id: 'wamid-legacy', sent_at: new Date().toISOString() },
+          },
+        }),
+      );
+      const { app, client } = await harness(dir);
+      const response = await send(app, { ...message('msg-old'), text: 'anything at all' });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ provider_message_id: 'wamid-legacy' });
+      expect(client.sent).toEqual([]);
+    });
+  });
+
+  it('test_fingerprint_is_not_reversible', async () => {
+    await withTempDir(async (dir) => {
+      const { app, file } = await harness(dir);
+      await send(app, message('msg-f'));
+      const stored = await readFile(file, 'utf8');
+      expect(stored).not.toContain(PHONE);
+      expect(stored).not.toContain('81234567890');
+      expect(stored).not.toContain('tagihan');
+      const parsed = JSON.parse(stored) as {
+        entries: Record<string, { fingerprint?: string }>;
+      };
+      expect(parsed.entries['msg-f']?.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    });
+  });
   it('test_concurrent_same_client_ref_sends_once', async () => {
     await withTempDir(async (dir) => {
       const { app, client } = await harness(dir);

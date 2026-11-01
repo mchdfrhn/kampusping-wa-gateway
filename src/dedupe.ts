@@ -18,13 +18,18 @@ export interface DedupeRecord {
   provider_message_id: string;
   /** ISO 8601 timestamp of the successful send. */
   sent_at: string;
+  /**
+   * sha256 of the recipient and text (see send.ts), so a reused ref with other content is
+   * detected. Absent in records written before it existed: those dedupe by ref only.
+   */
+  fingerprint?: string;
 }
 
 export interface DedupeStore {
   /** The record of an earlier successful send with this ref, unless it has expired. */
   get(clientRef: string): DedupeRecord | undefined;
   /** Remember a successful send (in memory at once, then persisted; rejects if the write fails). */
-  record(clientRef: string, providerMessageId: string): Promise<void>;
+  record(clientRef: string, providerMessageId: string, fingerprint?: string): Promise<void>;
   hasMessageId(providerMessageId: string): boolean;
   /** Drop expired records; resolves with how many were removed. */
   prune(): Promise<number>;
@@ -93,10 +98,11 @@ export async function openDedupeStore(options: DedupeOptions): Promise<DedupeSto
       const record = entries.get(clientRef);
       return record && !isExpired(record) ? record : undefined;
     },
-    async record(clientRef, providerMessageId) {
+    async record(clientRef, providerMessageId, fingerprint) {
       entries.set(clientRef, {
         provider_message_id: providerMessageId,
         sent_at: new Date(now()).toISOString(),
+        ...(fingerprint ? { fingerprint } : {}),
       });
       messageIds.add(providerMessageId);
       await persist();
@@ -151,7 +157,13 @@ async function readEntries(file: string, logger: Logger): Promise<Loaded> {
       typeof value.sent_at === 'string' &&
       !Number.isNaN(Date.parse(value.sent_at))
     ) {
-      result.set(ref, { provider_message_id: value.provider_message_id, sent_at: value.sent_at });
+      result.set(ref, {
+        provider_message_id: value.provider_message_id,
+        sent_at: value.sent_at,
+        ...(typeof value.fingerprint === 'string' && value.fingerprint !== ''
+          ? { fingerprint: value.fingerprint }
+          : {}),
+      });
     }
   }
   return result;

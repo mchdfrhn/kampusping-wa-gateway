@@ -47,3 +47,11 @@ export class NotOnWhatsAppError extends Error {
     this.name = 'NotOnWhatsAppError';
   }
 }
+
+/** The client_ref was already used for a message with other content (HTTP 409). */
+export class ClientRefConflictError extends Error {
+  constructor(message = 'client_ref was already used for different content') {
+    super(message);
+    this.name = 'ClientRefConflictError';
+  }
+}

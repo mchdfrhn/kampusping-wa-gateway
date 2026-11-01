@@ -14,7 +14,12 @@ import Fastify, {
 } from 'fastify';
 import type { Logger } from 'pino';
 
-import { DisconnectedError, NotOnWhatsAppError, type WaClient } from './client.js';
+import {
+  ClientRefConflictError,
+  DisconnectedError,
+  NotOnWhatsAppError,
+  type WaClient,
+} from './client.js';
 import type { DedupeStore } from './dedupe.js';
 import { createMessageSender, type SendRequest } from './send.js';
 
@@ -149,6 +154,9 @@ export function createApp(options: AppOptions): GatewayApp {
       answeredIds.set(request, outcome.providerMessageId);
       return reply.code(200).send({ provider_message_id: outcome.providerMessageId });
     } catch (error) {
+      if (error instanceof ClientRefConflictError) {
+        return reply.code(409).send({ error: 'client_ref_conflict' });
+      }
       if (error instanceof NotOnWhatsAppError) {
         logger.info({ ref: parsed.clientRef }, 'number is not on WhatsApp');
         return reply.code(404).send({ error: 'not_on_whatsapp' });
