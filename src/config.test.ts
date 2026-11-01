@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 
 import { ConfigError, loadConfig } from './config.js';
@@ -81,6 +82,14 @@ describe('loadConfig', () => {
     }
     const open = loadConfig(env({ GATEWAY_HOST: '0.0.0.0', GATEWAY_ALLOW_NON_LOOPBACK: 'true' }));
     expect(open.host).toBe('0.0.0.0');
+  });
+
+  it('test_config_rejects_dangerous_auth_dirs', () => {
+    for (const authDir of ['.', '..', '/', './data']) {
+      expect(problems({ WA_AUTH_DIR: authDir }).join(), authDir).toMatch(/WA_AUTH_DIR/);
+    }
+    expect(problems({ WA_AUTH_DIR: homedir() }).join()).toMatch(/WA_AUTH_DIR/);
+    expect(loadConfig(env({ WA_AUTH_DIR: './auth_state' })).authDir).toBe('./auth_state');
   });
 
   it('test_config_validates_numbers_and_levels', () => {

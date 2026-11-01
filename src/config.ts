@@ -2,6 +2,7 @@
  * Configuration from environment variables, validated once at startup. Problems are collected
  * and reported together; secret values are never echoed in the messages.
  */
+import { authDirProblem } from './authdir.js';
 
 export const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'] as const;
 /** Baileys logs message content and JIDs at debug/trace, so those levels are refused. */
@@ -42,7 +43,13 @@ const MIN_SECRET_LENGTH = 16;
 
 type Env = Record<string, string | undefined>;
 
-export function loadConfig(env: Env = process.env): GatewayConfig {
+export interface ConfigContext {
+  /** Defaults to process.cwd() and os.homedir(); injectable for tests. */
+  cwd?: string;
+  home?: string;
+}
+
+export function loadConfig(env: Env = process.env, context: ConfigContext = {}): GatewayConfig {
   const problems: string[] = [];
   const text = (name: string, fallback: string): string => {
     const value = env[name]?.trim();
@@ -120,6 +127,12 @@ export function loadConfig(env: Env = process.env): GatewayConfig {
     logLevel: oneOf('LOG_LEVEL', LOG_LEVELS, 'info'),
     baileysLogLevel: oneOf('WA_BAILEYS_LOG_LEVEL', BAILEYS_LOG_LEVELS, 'warn'),
   };
+
+  const authDirIssue = authDirProblem(config.authDir, {
+    ...context,
+    dedupeFile: config.dedupeFile,
+  });
+  if (authDirIssue) problems.push(authDirIssue);
 
   if (problems.length > 0) throw new ConfigError(problems);
   return config;

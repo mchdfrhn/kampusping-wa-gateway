@@ -18,8 +18,7 @@
  * tested; only 
 ealDeps (the real socket factory) needs a real phone (manual smoke test).
  */
-import { mkdir, readdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir } from 'node:fs/promises';
 import makeWASocket, {
   type AuthenticationState,
   type BaileysEventMap,
@@ -44,6 +43,7 @@ import {
   type ReceiptState,
   type WaClient,
 } from './client.js';
+import { swapAuthDir } from './authdir.js';
 import type { BaileysLogLevel } from './config.js';
 import { createBaileysLogger, type LibraryLogger } from './logging.js';
 import { maskPhone, phoneToJid } from './phone.js';
@@ -308,6 +308,48 @@ const TERMINAL_HINTS: Record<TerminalReason, string> = {
     'Check the phone before restarting the gateway or pairing again.',
 };
 
+/**
+ * Wrap an auth handle so that writes (credentials and signal keys) only happen while
+ * `isCurrent()` is true, and every write that does start is passed to `track`. After a logout
+ * the old socket may still try to save; those writes are dropped, and the ones already running
+ * are awaited before the folder is swapped, so stale credentials never land in the new session.
+ */
+export function gateAuthHandle(
+  handle: AuthHandle,
+  isCurrent: () => boolean,
+  track: (write: Promise<unknown>) => void,
+): AuthHandle {
+  const { keys } = handle.state;
+  const gatedKeys: AuthenticationState['keys'] = {
+    get: (type, ids) => keys.get(type, ids),
+    set: (data) => {
+      if (!isCurrent()) return Promise.resolve();
+      const write = Promise.resolve(keys.set(data));
+      track(write);
+      return write;
+    },
+    ...(keys.clear
+      ? {
+          clear: () => {
+            if (!isCurrent()) return Promise.resolve();
+            const write = Promise.resolve(keys.clear?.());
+            track(write);
+            return write;
+          },
+        }
+      : {}),
+  };
+  return {
+    state: { creds: handle.state.creds, keys: gatedKeys },
+    saveCreds: () => {
+      if (!isCurrent()) return Promise.resolve();
+      const write = handle.saveCreds();
+      track(write);
+      return write;
+    },
+  };
+}
+
 export function createBaileysClient(options: BaileysClientOptions): WaClient {
   const { authDir, logger } = options;
   const deps = options.deps ?? realDeps;
@@ -330,6 +372,14 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   let cancelReconnect: (() => void) | undefined;
   let stopped = false;
   let version: WAVersion | undefined;
+  const pendingWrites = new Set<Promise<unknown>>();
+  const trackWrite = (write: Promise<unknown>): void => {
+    pendingWrites.add(write);
+    write.then(
+      () => pendingWrites.delete(write),
+      () => pendingWrites.delete(write),
+    );
+  };
 
   const emit = (event: GatewayEvent): void => {
     for (const handler of handlers) {
@@ -410,7 +460,11 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     generation += 1;
     const current = generation;
     await mkdir(authDir, { recursive: true, mode: 0o700 });
-    const { state, saveCreds } = await deps.loadAuthState(authDir);
+    const { state, saveCreds } = gateAuthHandle(
+      await deps.loadAuthState(authDir),
+      () => current === generation,
+      trackWrite,
+    );
     const waVersion = await resolveVersion();
     if (current !== generation || stopped) return; // superseded meanwhile
 
@@ -458,13 +512,6 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   const asDisconnected = (error: unknown): unknown =>
     snapshot.state !== 'connected' || isConnectionError(error) ? new DisconnectedError() : error;
 
-  const wipeAuthDir = async (): Promise<void> => {
-    await mkdir(authDir, { recursive: true, mode: 0o700 });
-    for (const entry of await readdir(authDir)) {
-      await rm(join(authDir, entry), { recursive: true, force: true });
-    }
-  };
-
   return {
     async start() {
       stopped = false;
@@ -507,7 +554,10 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
         try {
           await current.logout();
         } catch (error) {
-          logger.warn({ code: disconnectCode(error) }, 'logout request failed; wiping anyway');
+          logger.warn(
+            { code: disconnectCode(error) },
+            'logout request failed; replacing the session anyway',
+          );
         }
         try {
           current.end(undefined);
@@ -515,11 +565,13 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
           // already closed
         }
       }
-      await wipeAuthDir();
+      // Writes the old session started before the cut-off land in the old folder first.
+      await Promise.allSettled([...pendingWrites]);
+      await swapAuthDir(authDir, { now: () => deps.now(), logger });
       jidCache.clear();
       sentMessages.clear();
       setSnapshot({ state: 'disconnected', qr: null });
-      logger.info('WhatsApp session wiped; starting over for a new QR code');
+      logger.info('WhatsApp session moved aside; starting over for a new QR code');
       reconnect = INITIAL_RECONNECT_STATE;
       if (!stopped) await connect();
     },

@@ -50,7 +50,7 @@ loopback address only.
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /messages` | Body `{"to":"+628...","text":"...","client_ref":"msg-123"}`. `200 {"provider_message_id":"..."}`; `404 {"error":"not_on_whatsapp"}`; `503 {"error":"disconnected"}` when the session is not connected; `400 {"error":"invalid_request"}` when `to` is not `^\+\d{8,15}$`, `text` is blank or over 4096 characters, `client_ref` is empty or over 100 characters, or the body is not a JSON object; `500 {"error":"internal"}` for anything unexpected (the backend retries). |
 | `GET /status`    | `200 {"state":"connected"\|"connecting"\|"qr"\|"disconnected","qr":<string\|null>}`                                                                                                                                                                                                                                                                                                                                                                                          |
-| `POST /logout`   | Unlinks the device, wipes `WA_AUTH_DIR` and starts over, so `GET /status` soon shows a new QR. `200 {"status":"ok"}`.                                                                                                                                                                                                                                                                                                                                                        |
+| `POST /logout`   | Unlinks the device, moves `WA_AUTH_DIR` aside (`<dir>.old-<epoch ms>`, only the newest copy is kept) and starts over with an empty folder, so `GET /status` soon shows a new QR. `200 {"status":"ok"}`.                                                                                                                                                                                                                                                                      |
 
 ### Exactly-once sending per `client_ref`
 
@@ -102,23 +102,23 @@ pruned on start and hourly.
 Copy `.env.example` to `.env` (the gateway reads `.env` from its working directory; real
 environment variables win). Startup fails with a clear list of problems when something is wrong.
 
-| Variable                     | Default                 | Notes                                                                                         |
-| ---------------------------- | ----------------------- | --------------------------------------------------------------------------------------------- |
-| `GATEWAY_HOST`               | `127.0.0.1`             | Must be `127.0.0.1`, `::1` or `localhost` unless `GATEWAY_ALLOW_NON_LOOPBACK=true`.           |
-| `GATEWAY_PORT`               | `8095`                  |                                                                                               |
-| `GATEWAY_ALLOW_NON_LOOPBACK` | `false`                 | Only for setups where the network is otherwise protected (containers).                        |
-| `WA_GATEWAY_API_KEY`         | (required)              | At least 16 characters; same value as the backend's `WA_GATEWAY_API_KEY`.                     |
-| `WA_WEBHOOK_URL`             | (required)              | http(s) URL of the backend webhook, e.g. `http://127.0.0.1:8093/api/v1/webhooks/whatsapp`.    |
-| `WA_WEBHOOK_SECRET`          | (required)              | At least 16 characters; same value as the backend's `WA_WEBHOOK_SECRET`.                      |
-| `WA_WEBHOOK_RETRIES`         | `5`                     | Retries after the first attempt (1-10).                                                       |
-| `WA_WEBHOOK_RETRY_BASE_MS`   | `1000`                  | First retry delay; doubles on every retry.                                                    |
-| `WA_WEBHOOK_TIMEOUT_MS`      | `10000`                 | Per attempt.                                                                                  |
-| `WA_STATUS_DELAY_MS`         | `2000`                  | Minimum delay between a send answer and its receipts (500-60000).                             |
-| `WA_AUTH_DIR`                | `./auth_state`          | Baileys session (credentials).                                                                |
-| `WA_DEDUPE_FILE`             | `./data/sent-refs.json` | `client_ref` store.                                                                           |
-| `WA_DEDUPE_TTL_DAYS`         | `14`                    | 14-365.                                                                                       |
-| `LOG_LEVEL`                  | `info`                  | Gateway log level.                                                                            |
-| `WA_BAILEYS_LOG_LEVEL`       | `warn`                  | Baileys log level: `silent`, `fatal`, `error`, `warn` or `info` (verbose levels log content). |
+| Variable                     | Default                 | Notes                                                                                                                                                                          |
+| ---------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GATEWAY_HOST`               | `127.0.0.1`             | Must be `127.0.0.1`, `::1` or `localhost` unless `GATEWAY_ALLOW_NON_LOOPBACK=true`.                                                                                            |
+| `GATEWAY_PORT`               | `8095`                  |                                                                                                                                                                                |
+| `GATEWAY_ALLOW_NON_LOOPBACK` | `false`                 | Only for setups where the network is otherwise protected (containers).                                                                                                         |
+| `WA_GATEWAY_API_KEY`         | (required)              | At least 16 characters; same value as the backend's `WA_GATEWAY_API_KEY`.                                                                                                      |
+| `WA_WEBHOOK_URL`             | (required)              | http(s) URL of the backend webhook, e.g. `http://127.0.0.1:8093/api/v1/webhooks/whatsapp`.                                                                                     |
+| `WA_WEBHOOK_SECRET`          | (required)              | At least 16 characters; same value as the backend's `WA_WEBHOOK_SECRET`.                                                                                                       |
+| `WA_WEBHOOK_RETRIES`         | `5`                     | Retries after the first attempt (1-10).                                                                                                                                        |
+| `WA_WEBHOOK_RETRY_BASE_MS`   | `1000`                  | First retry delay; doubles on every retry.                                                                                                                                     |
+| `WA_WEBHOOK_TIMEOUT_MS`      | `10000`                 | Per attempt.                                                                                                                                                                   |
+| `WA_STATUS_DELAY_MS`         | `2000`                  | Minimum delay between a send answer and its receipts (500-60000).                                                                                                              |
+| `WA_AUTH_DIR`                | `./auth_state`          | Baileys session. Refused at startup when it is a filesystem root, the working directory or a parent of it, the home directory or a parent of it, or contains `WA_DEDUPE_FILE`. |
+| `WA_DEDUPE_FILE`             | `./data/sent-refs.json` | `client_ref` store.                                                                                                                                                            |
+| `WA_DEDUPE_TTL_DAYS`         | `14`                    | 14-365.                                                                                                                                                                        |
+| `LOG_LEVEL`                  | `info`                  | Gateway log level.                                                                                                                                                             |
+| `WA_BAILEYS_LOG_LEVEL`       | `warn`                  | Baileys log level: `silent`, `fatal`, `error`, `warn` or `info` (verbose levels log content).                                                                                  |
 
 Generate secrets with e.g. `openssl rand -hex 32`.
 

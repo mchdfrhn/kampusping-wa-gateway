@@ -69,6 +69,9 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
   const timers: FakeTimer[] = [];
   const clock = { now: 1_000_000 };
   const versionsUsed: (number[] | undefined)[] = [];
+  const configs: Parameters<BaileysDeps['makeSocket']>[0][] = [];
+  /** Auth dirs that received a key write through the (gated) auth state. */
+  const keyWrites: string[] = [];
   let versionFetches = 0;
 
   const deps: BaileysDeps = {
@@ -76,7 +79,13 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
       const handle = {
         state: {
           creds: {},
-          keys: { get: () => Promise.resolve({}), set: () => Promise.resolve() },
+          keys: {
+            get: () => Promise.resolve({}),
+            set: () => {
+              keyWrites.push(dir);
+              return Promise.resolve();
+            },
+          },
         },
         saveCreds: () => (options.saveCreds ? options.saveCreds(dir) : Promise.resolve()),
       } as unknown as AuthHandle;
@@ -84,6 +93,7 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
     },
     makeSocket(config) {
       versionsUsed.push(config.version);
+      configs.push(config);
       const socket = new FakeSocket();
       sockets.push(socket);
       return socket;
@@ -110,6 +120,8 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
     timers,
     clock,
     versionsUsed,
+    configs,
+    keyWrites,
     versionFetches: () => versionFetches,
     /** Timers that are still waiting (not fired, not cancelled). */
     pendingTimers: () => timers.filter((timer) => !timer.cancelled),

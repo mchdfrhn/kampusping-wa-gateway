@@ -2,20 +2,25 @@
  * The Baileys client wiring, driven through a fake socket, fake timers and a manual clock
  * (no network, no real WhatsApp).
  */
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { createBaileysClient, DisconnectReason, STABLE_CONNECTION_MS } from './baileys.js';
 import type { GatewayEvent } from './client.js';
-import { closeWith, fakeBaileysDeps } from './test/fake-socket.js';
+import { closeWith, fakeBaileysDeps, type FakeDepsOptions } from './test/fake-socket.js';
 import { captureLogger, flush, silentLogger, withTempDir } from './test/fakes.js';
 
 function warnings(lines: string[]): string[] {
   return lines.filter((line) => line.includes('"level":40'));
 }
 
-async function startClient(dir: string, logger = silentLogger()) {
-  const fake = fakeBaileysDeps();
+async function startClient(
+  dir: string,
+  logger = silentLogger(),
+  fakeOptions: FakeDepsOptions = {},
+) {
+  const fake = fakeBaileysDeps(fakeOptions);
   const client = createBaileysClient({
     authDir: join(dir, 'auth'),
     logger,
@@ -106,6 +111,58 @@ describe('Baileys client wiring', () => {
       first.emit('messages.update', [{ key: { id: 'OLD', fromMe: true }, update: { status: 3 } }]);
       expect(events).toHaveLength(before);
       expect(client.snapshot().state).toBe('connected');
+    });
+  });
+
+  it('test_logout_swaps_the_auth_dir_and_old_socket_writes_never_reach_the_new_one', async () => {
+    await withTempDir(async (dir) => {
+      const auth = join(dir, 'auth');
+      let releaseSave: () => void = () => undefined;
+      const saveGate = new Promise<void>((resolve) => {
+        releaseSave = resolve;
+      });
+      let saves = 0;
+      const { client, fake } = await startClient(dir, silentLogger(), {
+        saveCreds: async (authDir) => {
+          saves += 1;
+          await saveGate;
+          await writeFile(join(authDir, 'creds.json'), `save-${saves}`);
+        },
+      });
+      const old = fake.sockets[0]!;
+      old.emit('connection.update', { connection: 'open' });
+      old.emit('creds.update', {}); // a credential write of the old session is in flight
+
+      const loggingOut = client.logout();
+      await flush();
+      // The swap waits for the in-flight write of the old session.
+      expect((await readdir(dir)).sort()).toEqual(['auth']);
+      releaseSave();
+      await loggingOut;
+      await fake.waitForSockets(2);
+
+      const entries = (await readdir(dir)).sort();
+      expect(entries).toHaveLength(2);
+      const oldDir = entries.find((entry) => entry.startsWith('auth.old-'))!;
+      expect(await readFile(join(dir, oldDir, 'creds.json'), 'utf8')).toBe('save-1');
+      expect(old.logoutCalls).toBe(1);
+      expect(old.endCalls).toBe(1);
+
+      // Late writes from the old socket are dropped instead of landing in the new session.
+      old.emit('creds.update', {});
+      await fake.configs[0]!.auth.keys.set({});
+      await flush();
+      expect(saves).toBe(1);
+      expect(fake.keyWrites).toEqual([]);
+      expect(await readdir(auth)).toEqual([]);
+
+      // The new session writes normally.
+      fake.sockets[1]!.emit('creds.update', {});
+      await fake.configs[1]!.auth.keys.set({});
+      releaseSave();
+      await flush();
+      expect(saves).toBe(2);
+      expect(fake.keyWrites).toEqual([auth]);
     });
   });
 });
