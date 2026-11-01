@@ -42,7 +42,7 @@ import {
   type ReceiptState,
   type WaClient,
 } from './client.js';
-import { swapAuthDir } from './authdir.js';
+import { removeOldAuthCopies, swapAuthDir } from './authdir.js';
 import type { BaileysLogLevel } from './config.js';
 import { createBaileysLogger, type LibraryLogger } from './logging.js';
 import { maskPhone, phoneToJid } from './phone.js';
@@ -279,6 +279,8 @@ export interface BaileysDeps {
   now(): number;
   /** Start a timer; the returned function cancels it. */
   setTimer(fn: () => void, ms: number): () => void;
+  /** Move the session folder aside on logout (default: `swapAuthDir` from authdir.ts). */
+  swapAuthDir?(authDir: string): Promise<void>;
 }
 
 const VERSION_FETCH_TIMEOUT_MS = 5000;
@@ -394,6 +396,7 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   let snapshot: ClientSnapshot = { state: 'disconnected', qr: null };
   let reconnect: ReconnectState = INITIAL_RECONNECT_STATE;
   let cancelReconnect: (() => void) | undefined;
+  let cancelCleanup: (() => void) | undefined;
   let stopped = false;
   let version: WAVersion | undefined;
   // Fetch at most once per process; only an invalid answer allows another try.
@@ -467,11 +470,34 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     }, delayMs);
   };
 
+  const clearCleanup = (): void => {
+    cancelCleanup?.();
+    cancelCleanup = undefined;
+  };
+
+  /**
+   * Once a session has stayed open for the stability window, the `<dir>.old-*` copies left by a
+   * logout are no longer needed and may hold live credentials: delete them (best effort).
+   */
+  const scheduleOldCopyCleanup = (): void => {
+    clearCleanup();
+    const current = generation;
+    cancelCleanup = deps.setTimer(() => {
+      cancelCleanup = undefined;
+      if (current !== generation || snapshot.state !== 'connected') return;
+      removeOldAuthCopies(authDir, logger).catch(() => undefined);
+    }, STABLE_CONNECTION_MS);
+  };
+
   const onConnectionUpdate = (update: Partial<ConnectionState>): void => {
     setSnapshot(nextSnapshot(snapshot, update));
-    if (update.connection === 'open') reconnect = { ...reconnect, openedAt: deps.now() };
+    if (update.connection === 'open') {
+      reconnect = { ...reconnect, openedAt: deps.now() };
+      scheduleOldCopyCleanup();
+    }
     if (update.connection !== 'close') return;
 
+    clearCleanup();
     sock = undefined;
     const code = disconnectCode(update.lastDisconnect?.error);
     const plan = planAfterClose(code, reconnect, deps.now(), policy);
@@ -579,6 +605,7 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
 
     async logout() {
       clearReconnect();
+      clearCleanup();
       const current = sock;
       sock = undefined;
       generation += 1; // ignore the events of the old socket from here on
@@ -599,7 +626,24 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
       }
       // Writes the old session started before the cut-off land in the old folder first.
       await Promise.allSettled([...pendingWrites]);
-      await swapAuthDir(authDir, { now: () => deps.now(), logger });
+      try {
+        await (deps.swapAuthDir
+          ? deps.swapAuthDir(authDir)
+          : swapAuthDir(authDir, { now: () => deps.now(), logger }));
+      } catch (error) {
+        // Never stay "connected" without a socket: report the truth and retry with backoff
+        // (the old session is still in place, so the reconnect uses it).
+        setSnapshot({ state: 'disconnected', qr: null });
+        const plan = planAfterClose(undefined, reconnect, deps.now(), policy);
+        reconnect = plan.next;
+        const delay = plan.action.kind === 'reconnect' ? plan.action.delayMs : 0;
+        logger.warn(
+          { code: (error as NodeJS.ErrnoException).code, retry_in_ms: delay },
+          'could not move the WhatsApp session aside during logout; reconnecting',
+        );
+        if (!stopped) scheduleReconnect(delay);
+        throw error;
+      }
       jidCache.clear();
       sentMessages.clear();
       setSnapshot({ state: 'disconnected', qr: null });
@@ -619,6 +663,7 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     stop() {
       stopped = true;
       clearReconnect();
+      clearCleanup();
       generation += 1;
       const current = sock;
       sock = undefined;

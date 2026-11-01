@@ -2,7 +2,7 @@
  * The Baileys client wiring, driven through a fake socket, fake timers and a manual clock
  * (no network, no real WhatsApp).
  */
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -218,6 +218,79 @@ describe('Baileys client wiring', () => {
       await reconnectOnce(fake, 2);
       expect(fake.versionFetches()).toBe(1);
       expect(fake.versionsUsed).toEqual([undefined, undefined]);
+    });
+  });
+
+  async function exists(path: string): Promise<boolean> {
+    return stat(path).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  it('test_old_auth_copy_is_deleted_after_the_new_session_stays_open', async () => {
+    await withTempDir(async (dir) => {
+      const oldCopy = join(dir, 'auth.old-1700000000000');
+      await mkdir(oldCopy);
+      await writeFile(join(oldCopy, 'creds.json'), 'still valid keys');
+      const { fake } = await startClient(dir);
+      fake.sockets[0]!.emit('connection.update', { connection: 'open' });
+      fake.clock.now += STABLE_CONNECTION_MS;
+      fake.fireTimer(STABLE_CONNECTION_MS);
+      for (let i = 0; i < 200 && (await exists(oldCopy)); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(await exists(oldCopy)).toBe(false);
+      expect(await exists(join(dir, 'auth'))).toBe(true);
+    });
+  });
+
+  it('test_old_auth_copy_stays_when_the_session_drops_before_the_stability_window', async () => {
+    await withTempDir(async (dir) => {
+      const oldCopy = join(dir, 'auth.old-1700000000000');
+      await mkdir(oldCopy);
+      const { fake } = await startClient(dir);
+      fake.sockets[0]!.emit('connection.update', { connection: 'open' });
+      fake.clock.now += 5000;
+      fake.sockets[0]!.emit('connection.update', closeWith(DisconnectReason.connectionClosed));
+      expect(fake.pendingTimers().some((timer) => timer.ms === STABLE_CONNECTION_MS)).toBe(false);
+      await flush();
+      expect(await exists(oldCopy)).toBe(true);
+    });
+  });
+
+  it('test_old_auth_copy_stays_when_the_session_is_no_longer_connected_at_the_deadline', async () => {
+    await withTempDir(async (dir) => {
+      const oldCopy = join(dir, 'auth.old-1700000000000');
+      await mkdir(oldCopy);
+      const { fake } = await startClient(dir);
+      fake.sockets[0]!.emit('connection.update', { connection: 'open' });
+      // The state leaves "connected" without a close event (e.g. a new pairing QR).
+      fake.sockets[0]!.emit('connection.update', { qr: '2@again' });
+      fake.clock.now += STABLE_CONNECTION_MS;
+      fake.fireTimer(STABLE_CONNECTION_MS);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await exists(oldCopy)).toBe(true);
+    });
+  });
+
+  it('test_failed_auth_swap_during_logout_reports_disconnected_and_reconnects', async () => {
+    await withTempDir(async (dir) => {
+      const { logger, lines } = captureLogger();
+      const { client, fake, events } = await startClient(dir, logger, {
+        swapAuthDir: () => Promise.reject(Object.assign(new Error('busy'), { code: 'EBUSY' })),
+      });
+      fake.sockets[0]!.emit('connection.update', { connection: 'open' });
+      const warningsBefore = warnings(lines).length;
+
+      await expect(client.logout()).rejects.toThrow('busy');
+      expect(client.snapshot()).toEqual({ state: 'disconnected', qr: null });
+      expect(events.at(-1)).toEqual({ type: 'connection', state: 'disconnected' });
+      expect(warnings(lines).length - warningsBefore).toBe(1);
+      expect(fake.pendingTimers().map((timer) => timer.ms)).toContain(2000);
+
+      fake.fireTimer(2000);
+      await fake.waitForSockets(2); // reconnects with the session that is still in place
     });
   });
 });

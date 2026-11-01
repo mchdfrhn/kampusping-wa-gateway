@@ -11,6 +11,9 @@
 # WhatsApp session (credentials) and the client_ref dedupe store: never committed
 /auth_state/
 /data/
+# Old session copies left by POST /logout (`<WA_AUTH_DIR>.old-<epoch ms>`), for any folder name
+*.old-*/
+/auth_state.old-*/
 
 # env (only the *.example templates are committed)
 .env*

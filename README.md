@@ -55,7 +55,7 @@ loopback address only.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /messages` | Body `{"to":"+628...","text":"...","client_ref":"msg-123"}`. `200 {"provider_message_id":"..."}`; `404 {"error":"not_on_whatsapp"}`; `409 {"error":"client_ref_conflict"}` when the `client_ref` was already used for a different recipient or text (permanent; the backend fails the message visibly); `503 {"error":"disconnected"}` when the session is not connected; `400 {"error":"invalid_request"}` when `to` is not `^\+\d{8,15}$`, `text` is blank or over 4096 characters, `client_ref` is empty or over 100 characters, or the body is not a JSON object; `500 {"error":"internal"}` for anything unexpected (the backend retries). |
 | `GET /status`    | `200 {"state":"connected"\|"connecting"\|"qr"\|"disconnected","qr":<string\|null>}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `POST /logout`   | Unlinks the device, moves `WA_AUTH_DIR` aside (`<dir>.old-<epoch ms>`, only the newest copy is kept) and starts over with an empty folder, so `GET /status` soon shows a new QR. `200 {"status":"ok"}`.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `POST /logout`   | Unlinks the device (when connected), moves `WA_AUTH_DIR` aside (`<dir>.old-<epoch ms>`, only the newest copy is kept, deleted automatically after the next stable connection; see "Data on disk") and starts over with an empty folder, so `GET /status` soon shows a new QR. `200 {"status":"ok"}`.                                                                                                                                                                                                                                                                                                                                            |
 
 ### Exactly-once sending per `client_ref`
 
@@ -169,17 +169,33 @@ banned:
   - connection replaced (another process uses the same session): stop the other process, then
     restart the gateway;
   - forbidden (number restricted or banned): check the phone first.
+  - After a terminal close there is no connected socket, so `POST /logout` only resets the
+    session locally (it moves the folder aside and shows a new QR); unlink the old device on the
+    phone under WhatsApp > Linked devices.
+- If moving the folder aside fails during `POST /logout` (the endpoint answers 500), the gateway
+  reports `disconnected` and reconnects with the normal backoff using the session still in place.
 - **Never run a restored copy of `auth_state/` while production is running** (another host, a
   test machine): both would hold the same session and kick each other off.
 
 ## Data on disk: protect and back up
 
-| Path          | Content                                       | If lost                                                     |
-| ------------- | --------------------------------------------- | ----------------------------------------------------------- |
-| `auth_state/` | WhatsApp session keys (equivalent to a login) | Pair again by QR. If copied, someone else can send as you.  |
-| `data/`       | `client_ref` dedupe store                     | Retries of recent messages may send duplicates for 14 days. |
+| Path                         | Content                                                                                                            | If lost                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| `auth_state/`                | WhatsApp session keys (equivalent to a login)                                                                      | Pair again by QR. If copied, someone else can send as you.  |
+| `data/`                      | `client_ref` dedupe store                                                                                          | Retries of recent messages may send duplicates for 14 days. |
+| `auth_state.old-<epoch ms>/` | Previous session moved aside by `POST /logout`. **As sensitive as `auth_state/`**: it can still hold a live login. | Nothing (deleted automatically, see below).                 |
 
-- Both are in `.gitignore`; never commit them and keep them out of any web root.
+- All of them are in `.gitignore` (`*.old-*/` covers any `WA_AUTH_DIR` name); never commit them
+  and keep them out of any web root.
+- **Old session copy.** `POST /logout` moves the session aside instead of deleting it, and only
+  the newest copy is kept. It can hold **valid credentials**: the remote unlink only happens when
+  a socket is connected, so after a terminal close (connection replaced, forbidden) or any other
+  disconnected state, `POST /logout` unlinks locally only. The gateway deletes every
+  `<WA_AUTH_DIR>.old-<digits>` copy automatically once a session has stayed connected for 60 s (the
+  same stability window as the reconnect backoff), logging only how many it removed. If the
+  gateway never reaches a stable connection, the copy stays: delete it by hand
+  (`rm -rf auth_state.old-*`) once the new pairing works, and remove the old device on the phone
+  under WhatsApp > Linked devices.
 - Owned by the PM2 user, mode `700` (the gateway creates `auth_state/` with `0700` and files
   in `data/` with `0600`): `chmod -R go-rwx auth_state data`.
 - Back both up together, encrypted, with the same care as other secrets. **Stop the gateway first**
@@ -207,7 +223,10 @@ banned:
 
 For backend development without a phone, set `WA_PROVIDER=fake` in the backend instead of running
 the gateway. Only `src/baileys.ts` imports Baileys; everything else is tested with a fake
-`WaClient`, a fake `fetch` and a manual clock. The socket wiring itself can only be verified with a
+`WaClient`, a fake `fetch` and a manual clock. A Vitest setup file (`src/test/setup.ts`) blocks the
+network in unit tests: the Baileys socket factory and version fetch throw, and `fetch` only
+reaches loopback hosts, so a test that forgets its fakes fails instead of contacting WhatsApp or
+GitHub. The socket wiring itself can only be verified with a
 real phone (manual smoke test before each release that touches the gateway).
 
 ## Production (PM2)

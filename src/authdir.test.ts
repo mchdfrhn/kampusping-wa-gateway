@@ -3,8 +3,8 @@ import { homedir } from 'node:os';
 import { join, parse, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { authDirProblem, swapAuthDir } from './authdir.js';
-import { silentLogger, withTempDir } from './test/fakes.js';
+import { authDirProblem, removeOldAuthCopies, swapAuthDir } from './authdir.js';
+import { captureLogger, silentLogger, withTempDir } from './test/fakes.js';
 
 describe('auth directory', () => {
   it('test_auth_dir_must_not_be_root_cwd_home_or_hold_the_dedupe_file', () => {
@@ -67,5 +67,36 @@ describe('auth directory', () => {
     expect(authDirProblem(homedir(), { cwd: '/tmp/x', dedupeFile: '/tmp/x/d.json' })).toMatch(
       /home/,
     );
+  });
+
+  it('test_remove_old_auth_copies_deletes_only_matching_siblings_and_logs_without_paths', async () => {
+    await withTempDir(async (dir) => {
+      const auth = join(dir, 'auth_state');
+      for (const name of [
+        'auth_state',
+        'auth_state.old-1',
+        'auth_state.old-22',
+        'auth_state.old-x',
+        'other.old-5',
+      ]) {
+        await mkdir(join(dir, name));
+        await writeFile(join(dir, name, 'creds.json'), name);
+      }
+      const { logger, lines } = captureLogger();
+      expect(await removeOldAuthCopies(auth, logger)).toBe(2);
+      expect((await readdir(dir)).sort()).toEqual([
+        'auth_state',
+        'auth_state.old-x',
+        'other.old-5',
+      ]);
+      expect(await readFile(join(auth, 'creds.json'), 'utf8')).toBe('auth_state');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).not.toContain(dir.replace(/\\/g, '\\\\'));
+      expect(lines[0]).not.toContain('auth_state');
+
+      // Nothing to remove: nothing logged.
+      expect(await removeOldAuthCopies(auth, logger)).toBe(0);
+      expect(lines).toHaveLength(1);
+    });
   });
 });

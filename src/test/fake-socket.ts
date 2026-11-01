@@ -62,6 +62,8 @@ export interface FakeDepsOptions {
   /** Replaces the default no-op credential save (receives the auth dir of that session). */
   saveCreds?: (authDir: string) => Promise<void>;
   fetchVersion?: BaileysDeps['fetchVersion'];
+  /** Replaces the real auth folder swap done by logout(). */
+  swapAuthDir?: BaileysDeps['swapAuthDir'];
 }
 
 export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
@@ -104,6 +106,7 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
         ? options.fetchVersion()
         : Promise.resolve({ version: [2, 3000, 1], isLatest: true });
     },
+    ...(options.swapAuthDir ? { swapAuthDir: options.swapAuthDir } : {}),
     now: () => clock.now,
     setTimer(fn, ms) {
       const timer: FakeTimer = { fn, ms, cancelled: false };
@@ -132,6 +135,14 @@ export function fakeBaileysDeps(options: FakeDepsOptions = {}) {
       }
       if (sockets.length < count)
         throw new Error(`expected ${count} sockets, got ${sockets.length}`);
+    },
+    /** Fire the pending timer with this delay. */
+    fireTimer(ms: number): FakeTimer {
+      const timer = timers.find((candidate) => !candidate.cancelled && candidate.ms === ms);
+      if (!timer) throw new Error(`no pending timer of ${ms} ms`);
+      timer.cancelled = true;
+      timer.fn();
+      return timer;
     },
     /** Fire the most recent pending timer. */
     fireLast(): FakeTimer {

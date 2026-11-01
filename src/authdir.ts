@@ -5,7 +5,10 @@
  * never be accepted: `authDirProblem` is checked at startup. The swap itself never deletes the
  * session in place: the folder is renamed to `<dir>.old-<epoch ms>` and recreated empty (0700).
  * Only the newest old copy is kept (useful if a disconnect was clicked by mistake while the
- * device was not unlinked yet); older `<dir>.old-*` siblings are deleted.
+ * device was not unlinked yet); older `<dir>.old-*` siblings are deleted. The old copy can hold
+ * live credentials (no remote unlink happens without a connected socket), so the client deletes
+ * every old copy with `removeOldAuthCopies` once a session has stayed open for the stability
+ * window (STABLE_CONNECTION_MS in baileys.ts).
  */
 import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -80,9 +83,8 @@ export async function swapAuthDir(authDir: string, options: SwapOptions): Promis
   }
   await mkdir(target, { recursive: true, mode: 0o700 });
 
-  const prefix = `${name}.old-`;
   for (const entry of await readdir(parent)) {
-    if (entry.startsWith(prefix) && entry !== kept && /^\d+$/.test(entry.slice(prefix.length))) {
+    if (entry !== kept && isOldCopyOf(name, entry)) {
       await rm(join(parent, entry), { recursive: true, force: true }).catch((error: unknown) =>
         options.logger.warn(
           { code: (error as NodeJS.ErrnoException).code },
@@ -91,4 +93,41 @@ export async function swapAuthDir(authDir: string, options: SwapOptions): Promis
       );
     }
   }
+}
+
+function isOldCopyOf(name: string, entry: string): boolean {
+  const prefix = `${name}.old-`;
+  return entry.startsWith(prefix) && /^\d+$/.test(entry.slice(prefix.length));
+}
+
+/**
+ * Delete every `<basename>.old-<digits>` sibling of `authDir` (best effort). Logs one line with
+ * the count only (no paths). Resolves with how many were removed.
+ */
+export async function removeOldAuthCopies(authDir: string, logger: Logger): Promise<number> {
+  const target = resolve(authDir);
+  const parent = dirname(target);
+  const name = basename(target);
+  let entries: string[];
+  try {
+    entries = await readdir(parent);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  let failed = 0;
+  for (const entry of entries) {
+    if (!isOldCopyOf(name, entry)) continue;
+    try {
+      await rm(join(parent, entry), { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  if (removed > 0 || failed > 0) {
+    const log = failed > 0 ? logger.warn.bind(logger) : logger.info.bind(logger);
+    log({ removed, failed }, 'old WhatsApp session copies deleted after a stable connection');
+  }
+  return removed;
 }
