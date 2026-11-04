@@ -85,6 +85,42 @@ describe('Baileys client wiring', () => {
     });
   });
 
+  it('test_unscanned_qr_that_expires_is_replaced_at_once_and_the_backoff_does_not_grow', async () => {
+    await withTempDir(async (dir) => {
+      const { client, fake } = await startClient(dir);
+      const delays: number[] = [];
+      for (let i = 0; i < 4; i += 1) {
+        const socket = fake.sockets.at(-1)!;
+        socket.emit('connection.update', { qr: `qr-${i}` });
+        expect(client.snapshot().state).toBe('qr');
+        // Nobody scanned in time (Baileys: "QR refs attempts ended", code 408). Not a failure:
+        // the panel must not flash "Terputus" and the next QR must not wait for a long backoff.
+        socket.emit('connection.update', closeWith(DisconnectReason.timedOut));
+        expect(client.snapshot()).toEqual({ state: 'connecting', qr: null });
+        delays.push(fake.fireLast().ms);
+        await fake.waitForSockets(i + 2);
+      }
+      expect(delays).toEqual([2000, 2000, 2000, 2000]);
+    });
+  });
+
+  it('test_timeout_of_an_open_session_still_backs_off', async () => {
+    await withTempDir(async (dir) => {
+      const { client, fake } = await startClient(dir);
+      const delays: number[] = [];
+      for (let i = 0; i < 2; i += 1) {
+        const socket = fake.sockets.at(-1)!;
+        socket.emit('connection.update', { connection: 'open' });
+        fake.clock.now += 5000;
+        socket.emit('connection.update', closeWith(DisconnectReason.timedOut));
+        expect(client.snapshot()).toEqual({ state: 'disconnected', qr: null });
+        delays.push(fake.fireLast().ms);
+        await fake.waitForSockets(i + 2);
+      }
+      expect(delays).toEqual([2000, 4000]); // a registered number is never retried in a hurry
+    });
+  });
+
   it('test_restart_required_restarts_at_once_at_most_three_times_in_a_row', async () => {
     await withTempDir(async (dir) => {
       const { fake } = await startClient(dir);

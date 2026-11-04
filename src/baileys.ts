@@ -165,16 +165,28 @@ const TERMINAL_CODES = new Map<number, TerminalReason>([
  * What to do after the socket closed with `code`. Repeated logins are what gets a number banned,
  * so the backoff only starts over after a connection stayed open for STABLE_CONNECTION_MS, and
  * immediate restarts are capped.
+ *
+ * `qrExpired` means the socket was waiting for a scan when it closed with a timeout (Baileys:
+ * "QR refs attempts ended", 408). No number is registered yet, so this is no login attempt and
+ * no failure: a fresh QR is requested after the base delay, without growing the backoff.
  */
 export function planAfterClose(
   code: number | undefined,
   state: ReconnectState,
   now: number,
   policy: ReconnectPolicy,
+  qrExpired = false,
 ): { action: CloseAction; next: ReconnectState } {
   const stable = state.openedAt !== null && now - state.openedAt >= STABLE_CONNECTION_MS;
   const attempt = stable ? 0 : state.attempt;
   const restarts = stable ? 0 : state.restarts;
+
+  if (qrExpired && code === DisconnectReason.timedOut) {
+    return {
+      action: { kind: 'reconnect', delayMs: policy.baseMs },
+      next: { attempt, restarts, openedAt: null },
+    };
+  }
 
   const terminal = code === undefined ? undefined : TERMINAL_CODES.get(code);
   if (terminal) {
@@ -490,6 +502,7 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
   };
 
   const onConnectionUpdate = (update: Partial<ConnectionState>): void => {
+    const waitingForScan = snapshot.state === 'qr';
     setSnapshot(nextSnapshot(snapshot, update));
     if (update.connection === 'open') {
       reconnect = { ...reconnect, openedAt: deps.now() };
@@ -500,10 +513,14 @@ export function createBaileysClient(options: BaileysClientOptions): WaClient {
     clearCleanup();
     sock = undefined;
     const code = disconnectCode(update.lastDisconnect?.error);
-    const plan = planAfterClose(code, reconnect, deps.now(), policy);
+    const plan = planAfterClose(code, reconnect, deps.now(), policy, waitingForScan);
     reconnect = plan.next;
     if (stopped) return;
     const { action } = plan;
+    if (waitingForScan && code === DisconnectReason.timedOut) {
+      // The unscanned QR simply expired: show "connecting" until the next one, not "disconnected".
+      setSnapshot({ state: 'connecting', qr: null });
+    }
     if (action.kind === 'terminal') {
       // One warning per terminal close, reason code only.
       logger.warn({ code, reason: action.reason }, TERMINAL_HINTS[action.reason]);
